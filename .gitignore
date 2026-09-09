@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+# The entire data/ directory, not just the expected db filenames -- an
+# archived/renamed db file (data/archive/monitor.db.bloated-YYYYMMDD) was
+# found staged by a plain `git add -A` because it doesn't end in exactly
+# `.db`, and the old narrower patterns below didn't catch it. data/ is
+# always local, never meant to be committed (see README Quick Start) --
+# ignore the whole directory rather than trying to enumerate filenames.
+data/
+*.db
+*.db-shm
+*.db-wal
+.env
+.venv/

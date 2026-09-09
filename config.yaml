@@ -1,0 +1,53 @@
+ollama:
+  services:
+    - name: "gpu-unified"
+      port: 18434
+      public_port: 11434
+      gpu_ids: [1, 2, 3, 4, 5, 6]
+      model: "qwen3-coder-next:Q4_K_M"
+      description: "Unified 6x P100 pool — Ollama bound internally on `port`; `public_port` is what LAN clients connect to. Example assumes a reverse proxy sits in front (nginx, Caddy, a firewall rule, etc.) rejecting destructive methods like DELETE and forwarding everything else — this tool doesn't require one, but if you have one, point public_port at it."
+      systemd_service: "ollama-unified.service"
+    - name: "meta"
+      port: 11435
+      gpu_ids: [0]
+      model: "qwen2.5-coder:7b"
+      description: "GPU 0 (RTX 2080 Ti) meta pool — provisioned, intentionally dormant. Confirmed disabled with zero journal history as of 2026-09. Not an error state; do not alert on it being unreachable."
+      systemd_service: "ollama-meta.service"
+      enabled: false
+
+collectors:
+  gpu_poll_interval_seconds: 2
+  gpu_hardware_poll_interval_seconds: 60
+  ollama_state_poll_interval_seconds: 5
+  log_poll_interval_seconds: 1
+  connections_poll_interval_seconds: 5
+
+storage:
+  db_path: "data/monitor.db"
+  retention_days: 7
+
+patterns:
+  latency_spike_threshold_ms: 5000
+  swap_spike_multiplier: 5.0
+  quota_exhaustion_keywords:
+    - "quota exceeded"
+    - "quota exhausted"
+    - "rate limit"
+    - "rate limited"
+    - "too many requests"
+    - "429"
+  cpu_spillover_threshold_percent: 80
+  baseline_window_minutes: 10
+  # New thresholds, added for the failure modes actually diagnosed on this
+  # box (reload storms, connection pileups, near-zero keep_alive, ctx churn).
+  reload_storm_count_threshold: 5
+  reload_storm_window_seconds: 300
+  ctx_churn_distinct_values_threshold: 2
+  ctx_churn_window_seconds: 900
+  near_zero_keep_alive_seconds: 5
+  connection_pileup_threshold: 6
+
+server:
+  host: "0.0.0.0"
+  port: 8082
+  cors_origins: ["*"]

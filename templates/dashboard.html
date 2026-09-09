@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sovren — GPU Ollama Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg:      #0c0b0b;
+  --surf:    #111010;
+  --surf2:   #161514;
+  --border:  #1f1e1d;
+  --muted:   #575350;
+  --dim:     #8c8784;
+  --text:    #dcd9d4;
+  --accent:  #c8681e;
+  --accentA: rgba(200,104,30,.11);
+  --green:   #2d8a5a;
+  --greenA:  rgba(45,138,90,.15);
+  --yellow:  #9e8818;
+  --yellowA: rgba(158,136,24,.15);
+  --red:     #8a2d2d;
+  --redA:    rgba(138,45,45,.15);
+  --blue:    #3a6ea5;
+  --mono:    'Menlo','Monaco','Courier New',monospace;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{min-height:100%}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:12px;line-height:1.5;padding-bottom:40px}
+a{color:inherit}
+
+.topbar{height:44px;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 18px;gap:16px;position:sticky;top:0;background:var(--bg);z-index:10}
+.topbar-brand{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent)}
+.topbar-clock{margin-left:auto;font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+.ws-dot{width:6px;height:6px;border-radius:50%;background:var(--muted)}
+.ws-dot.live{background:var(--green);animation:blink 2s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+.wrap{max-width:1280px;margin:0 auto;padding:20px 18px;display:flex;flex-direction:column;gap:20px}
+
+/* HERO */
+.hero{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:4px;overflow:hidden}
+.hero-svc{background:var(--surf);padding:16px 18px;display:flex;flex-direction:column;gap:10px}
+.hero-top{display:flex;align-items:center;justify-content:space-between}
+.hero-name{font-size:13px;color:var(--text)}
+.status-pill{font-size:9px;letter-spacing:.1em;text-transform:uppercase;padding:3px 9px;border-radius:2px;font-weight:600}
+.status-pill.STABLE{color:var(--green);background:var(--greenA);border:1px solid var(--green)}
+.status-pill.IDLE{color:var(--dim);background:var(--surf2);border:1px solid var(--border)}
+.status-pill.RELOADING{color:var(--yellow);background:var(--yellowA);border:1px solid var(--yellow)}
+.status-pill.DEGRADED{color:var(--red);background:var(--redA);border:1px solid var(--red)}
+.status-pill.DISABLED{color:var(--muted);background:var(--surf2);border:1px solid var(--border)}
+.hero-reason{font-size:10px;color:var(--yellow)}
+.hero-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:10px}
+.hero-grid dt{color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-size:8px}
+.hero-grid dd{color:var(--text);font-variant-numeric:tabular-nums;margin-top:2px}
+
+/* GAUGES */
+.gauge-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:4px;overflow:hidden}
+.gauge{background:var(--surf);padding:12px 16px}
+.gauge-label{font-size:8px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.gauge-value{font-size:22px;font-variant-numeric:tabular-nums}
+.gauge-value.warn{color:var(--yellow)}
+.gauge-value.crit{color:var(--red)}
+.gauge-sub{font-size:9px;color:var(--dim);margin-top:2px}
+
+/* SECTIONS */
+.section{background:var(--surf);border:1px solid var(--border);border-radius:4px;overflow:hidden}
+.section-head{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.section-title{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.section-body{padding:14px 16px}
+
+/* TIMELINE */
+.timeline{display:flex;flex-direction:column;gap:6px}
+.timeline-row{display:flex;align-items:center;gap:10px}
+.timeline-svc{font-size:9px;color:var(--dim);width:90px;flex-shrink:0}
+.timeline-track{flex:1;display:flex;gap:1px;height:22px;background:var(--surf2);border-radius:2px;overflow:hidden}
+.timeline-seg{height:100%;min-width:3px;cursor:pointer;position:relative}
+.timeline-seg.success{background:var(--green)}
+.timeline-seg.failed{background:var(--red)}
+.timeline-seg.superseded{background:var(--muted)}
+.timeline-seg.pending{background:var(--yellow);animation:blink 1.2s ease-in-out infinite}
+.timeline-seg:hover::after{
+  content:attr(data-tip);position:absolute;bottom:26px;left:0;background:var(--surf2);
+  border:1px solid var(--border);padding:6px 8px;font-size:9px;white-space:nowrap;z-index:20;
+  color:var(--text);border-radius:2px;
+}
+.timeline-empty{font-size:10px;color:var(--dim);padding:8px 0}
+.timeline-legend{display:flex;gap:14px;margin-top:10px;font-size:9px;color:var(--dim)}
+.legend-dot{width:8px;height:8px;display:inline-block;border-radius:1px;margin-right:5px;vertical-align:-1px}
+
+/* GPU HARDWARE CHECKLIST */
+.hw-table{width:100%;border-collapse:collapse;font-size:10px}
+.hw-table th{text-align:left;font-size:8px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:4px 8px;border-bottom:1px solid var(--border)}
+.hw-table td{padding:5px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+.hw-ok{color:var(--green)}
+.hw-warn{color:var(--yellow)}
+.hw-crit{color:var(--red);font-weight:600}
+
+/* GPU LOAD STRIP */
+.load-strip{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+.load-bar-wrap{display:flex;flex-direction:column;align-items:center;gap:4px}
+.load-bar-track{width:100%;height:70px;background:var(--surf2);border-radius:2px;display:flex;align-items:flex-end;overflow:hidden}
+.load-bar-fill{width:100%;background:var(--accent);transition:height .3s}
+.load-bar-label{font-size:8px;color:var(--dim)}
+
+/* TABLES */
+table.data{width:100%;border-collapse:collapse;font-size:10px}
+table.data th{text-align:left;font-size:8px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding:5px 8px;border-bottom:1px solid var(--border)}
+table.data td{padding:5px 8px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums;color:var(--text)}
+table.data tr:hover td{background:var(--surf2)}
+.empty-row td{color:var(--dim);font-style:italic}
+
+/* PATTERNS */
+.pattern-list{display:flex;flex-direction:column;gap:1px;max-height:280px;overflow-y:auto}
+.pattern-item{padding:8px 10px;display:flex;gap:10px;align-items:flex-start;border-left:2px solid var(--border);background:var(--surf2)}
+.pattern-item.critical{border-left-color:var(--red)}
+.pattern-item.warning{border-left-color:var(--yellow)}
+.pattern-item.info{border-left-color:var(--blue)}
+.pattern-sev{font-size:8px;text-transform:uppercase;letter-spacing:.08em;flex-shrink:0;width:52px;padding-top:1px}
+.pattern-item.critical .pattern-sev{color:var(--red)}
+.pattern-item.warning .pattern-sev{color:var(--yellow)}
+.pattern-item.info .pattern-sev{color:var(--blue)}
+.pattern-desc{font-size:10px;color:var(--text)}
+.pattern-time{font-size:8px;color:var(--muted);margin-top:2px}
+
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media (max-width:900px){.two-col{grid-template-columns:1fr}}
+
+canvas{max-width:100%}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="ws-dot" id="wsDot"></div>
+  <div class="topbar-brand">Sovren · GPU Ollama Monitor</div>
+  <div class="topbar-clock" id="clock">—</div>
+</div>
+
+<div class="wrap">
+
+  <!-- HERO: is this healthy right now -->
+  <div class="hero" id="hero"></div>
+
+  <!-- GAUGES -->
+  <div class="gauge-row" id="gauges"></div>
+
+  <!-- RELOAD-CYCLE TIMELINE -->
+  <div class="section">
+    <div class="section-head"><span class="section-title">Load Cycle Timeline</span>
+      <span style="font-size:9px;color:var(--muted)">last 50 cycles per service</span></div>
+    <div class="section-body">
+      <div class="timeline" id="timeline"></div>
+      <div class="timeline-legend">
+        <span><span class="legend-dot" style="background:var(--green)"></span>success</span>
+        <span><span class="legend-dot" style="background:var(--red)"></span>failed / cancelled</span>
+        <span><span class="legend-dot" style="background:var(--muted)"></span>superseded</span>
+        <span><span class="legend-dot" style="background:var(--yellow)"></span>loading now</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="two-col">
+    <!-- GPU HARDWARE -->
+    <div class="section">
+      <div class="section-head"><span class="section-title">GPU Hardware Health</span></div>
+      <div class="section-body">
+        <table class="hw-table" id="hwTable">
+          <thead><tr><th>GPU</th><th>ECC Corrected</th><th>ECC Uncorrected</th><th>Retired Pages</th><th>Status</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- REAL VS HEARTBEAT -->
+    <div class="section">
+      <div class="section-head"><span class="section-title">Real Work vs. Heartbeat Traffic</span>
+        <span style="font-size:9px;color:var(--muted)">last hour</span></div>
+      <div class="section-body" id="taskSummary"></div>
+    </div>
+  </div>
+
+  <!-- GPU LOAD STRIP -->
+  <div class="section">
+    <div class="section-head"><span class="section-title">GPU Compute (live)</span></div>
+    <div class="section-body">
+      <div class="load-strip" id="loadStrip"></div>
+    </div>
+  </div>
+
+  <div class="two-col">
+    <!-- CONNECTIONS CHART -->
+    <div class="section">
+      <div class="section-head"><span class="section-title">Established Connections</span></div>
+      <div class="section-body"><canvas id="connChart" height="140"></canvas></div>
+    </div>
+
+    <!-- PATTERNS -->
+    <div class="section">
+      <div class="section-head"><span class="section-title">Patterns &amp; Alerts</span></div>
+      <div class="section-body"><div class="pattern-list" id="patternList"></div></div>
+    </div>
+  </div>
+
+  <div class="two-col">
+    <div class="section">
+      <div class="section-head"><span class="section-title">Requests by Model / Service</span></div>
+      <div class="section-body"><table class="data" id="modelTable"><thead>
+        <tr><th>Model / Service</th><th>Reqs</th><th>Avg Latency</th><th>Errors</th></tr>
+      </thead><tbody></tbody></table></div>
+    </div>
+    <div class="section">
+      <div class="section-head"><span class="section-title">Requests by Caller IP</span></div>
+      <div class="section-body"><table class="data" id="callerTable"><thead>
+        <tr><th>Caller IP</th><th>Reqs</th><th>Avg Latency</th><th>Errors</th></tr>
+      </thead><tbody></tbody></table></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmtDuration = (s) => {
+  if (s == null) return '—';
+  s = Math.max(0, s);
+  if (s < 60) return s.toFixed(0) + 's';
+  if (s < 3600) return (s/60).toFixed(1) + 'm';
+  return (s/3600).toFixed(1) + 'h';
+};
+const fmtTime = (ts) => ts ? new Date(ts*1000).toLocaleTimeString() : '—';
+const fmtCountdown = (ts) => {
+  if (!ts) return '—';
+  const diff = ts - Date.now()/1000;
+  if (diff < 0) return 'expired';
+  return fmtDuration(diff) + ' left';
+};
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url + ' -> ' + r.status);
+  return r.json();
+}
+
+function renderHero(status) {
+  const el = $('hero');
+  el.innerHTML = '';
+  for (const [name, s] of Object.entries(status)) {
+    const card = document.createElement('div');
+    card.className = 'hero-svc';
+    if (!s.enabled) {
+      card.innerHTML = `<div class="hero-top"><span class="hero-name">${name}</span>
+        <span class="status-pill DISABLED">disabled</span></div>
+        <div class="hero-reason" style="color:var(--dim)">Intentionally not running — not an error.</div>`;
+      el.appendChild(card);
+      continue;
+    }
+    card.innerHTML = `
+      <div class="hero-top">
+        <span class="hero-name">${name}</span>
+        <span class="status-pill ${s.status}">${s.status}</span>
+      </div>
+      ${s.status_reason ? `<div class="hero-reason">${s.status_reason}</div>` : ''}
+      <dl class="hero-grid">
+        <div><dt>Model</dt><dd>${s.model || '—'}</dd></div>
+        <div><dt>Context</dt><dd>${s.ctx ? s.ctx.toLocaleString() : '—'}</dd></div>
+        <div><dt>Loaded Since</dt><dd>${s.loaded_since ? fmtTime(s.loaded_since) : '—'}</dd></div>
+        <div><dt>Keep-Alive</dt><dd>${fmtCountdown(s.keep_alive_expires_at)}</dd></div>
+      </dl>`;
+    el.appendChild(card);
+  }
+}
+
+function renderGauges(status) {
+  const el = $('gauges');
+  el.innerHTML = '';
+  for (const [name, s] of Object.entries(status)) {
+    if (!s.enabled) continue;
+    const mk = (label, value, sub, cls) => `
+      <div class="gauge">
+        <div class="gauge-label">${name} · ${label}</div>
+        <div class="gauge-value ${cls||''}">${value}</div>
+        <div class="gauge-sub">${sub||''}</div>
+      </div>`;
+    el.insertAdjacentHTML('beforeend', mk('Connections', s.established_connections,
+      s.established_connections >= 6 ? 'above pileup threshold' : 'nominal',
+      s.established_connections >= 6 ? 'crit' : ''));
+    el.insertAdjacentHTML('beforeend', mk('Reloads / 5min', s.reload_count_5m, '', s.reload_count_5m >= 5 ? 'warn' : ''));
+    el.insertAdjacentHTML('beforeend', mk('Ctx values / 15min', s.distinct_ctx_15m, s.distinct_ctx_15m >= 2 ? 'context churn' : '', s.distinct_ctx_15m >= 2 ? 'warn' : ''));
+  }
+}
+
+function renderTimeline(cycles) {
+  const el = $('timeline');
+  if (!cycles.length) { el.innerHTML = '<div class="timeline-empty">No load cycles recorded yet.</div>'; return; }
+  const byService = {};
+  for (const c of cycles) (byService[c.service_name] ||= []).push(c);
+  el.innerHTML = '';
+  for (const [svc, list] of Object.entries(byService)) {
+    list.sort((a,b) => a.start_ts - b.start_ts);
+    const row = document.createElement('div');
+    row.className = 'timeline-row';
+    const track = document.createElement('div');
+    track.className = 'timeline-track';
+    for (const c of list.slice(-50)) {
+      const seg = document.createElement('div');
+      seg.className = 'timeline-seg ' + c.outcome;
+      seg.style.flex = '1';
+      const dur = c.duration_s != null ? c.duration_s.toFixed(0) + 's' : 'in progress';
+      seg.setAttribute('data-tip',
+        `${new Date(c.start_ts*1000).toLocaleTimeString()} · ctx=${c.ctx_requested ?? '?'} · ${c.outcome} · ${dur}` +
+        (c.triggering_client_ip ? ` · from ${c.triggering_client_ip}` : ''));
+      track.appendChild(seg);
+    }
+    row.innerHTML = `<span class="timeline-svc">${svc}</span>`;
+    row.appendChild(track);
+    el.appendChild(row);
+  }
+}
+
+function renderHardware(rows) {
+  const tbody = $('hwTable').querySelector('tbody');
+  tbody.innerHTML = '';
+  if (!rows.length) { tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No hardware samples yet (polls every 60s).</td></tr>'; return; }
+  for (const r of rows) {
+    const corrected = r.ecc_corrected_volatile;
+    const uncorrected = r.ecc_uncorrected_volatile;
+    const retired = r.retired_pages_pending;
+    let statusCls = 'hw-ok', statusText = 'clean';
+    if (retired) { statusCls = 'hw-crit'; statusText = 'DEGRADED'; }
+    else if (uncorrected > 0) { statusCls = 'hw-crit'; statusText = 'ECC FAULT'; }
+    else if (corrected > 100) { statusCls = 'hw-warn'; statusText = 'watch'; }
+    tbody.insertAdjacentHTML('beforeend', `<tr>
+      <td>GPU ${r.gpu_index}</td>
+      <td>${corrected ?? 'N/A'}</td>
+      <td class="${uncorrected > 0 ? 'hw-crit' : ''}">${uncorrected ?? 'N/A'}</td>
+      <td class="${retired ? 'hw-crit' : ''}">${retired ? 'YES' : 'No'}</td>
+      <td class="${statusCls}">${statusText}</td>
+    </tr>`);
+  }
+}
+
+let loadStripChart = {};
+function renderLoadStrip(samples) {
+  const el = $('loadStrip');
+  const latest = {};
+  for (const s of samples) latest[s.gpu_index] = s;
+  const indices = Object.keys(latest).map(Number).sort((a,b)=>a-b);
+  if (!el.children.length) {
+    el.innerHTML = indices.map(i => `
+      <div class="load-bar-wrap">
+        <div class="load-bar-track"><div class="load-bar-fill" id="bar-${i}" style="height:0%"></div></div>
+        <div class="load-bar-label" id="lbl-${i}">GPU ${i}</div>
+      </div>`).join('');
+  }
+  for (const i of indices) {
+    const s = latest[i];
+    const bar = $('bar-' + i);
+    if (bar) bar.style.height = (s.gpu_utilization_percent || 0) + '%';
+    const lbl = $('lbl-' + i);
+    if (lbl) lbl.textContent = `GPU ${i} · ${(s.gpu_utilization_percent||0).toFixed(0)}%`;
+  }
+}
+
+function renderTaskSummary(data) {
+  const el = $('taskSummary');
+  const total = data.real_count + data.heartbeat_count;
+  if (!total) { el.innerHTML = '<div style="color:var(--dim);font-size:10px">No task samples yet.</div>'; return; }
+  el.innerHTML = `
+    <div style="display:flex;gap:24px;margin-bottom:10px">
+      <div><div class="gauge-value">${data.real_count}</div><div class="gauge-sub">real / varied jobs</div></div>
+      <div><div class="gauge-value" style="color:var(--dim)">${data.heartbeat_count}</div><div class="gauge-sub">heartbeat pings</div></div>
+    </div>
+    <div style="font-size:9px;color:var(--muted)">Likely heartbeat signature: ${data.likely_heartbeat_signature ?? '—'} tokens
+      (most repeated exact token count in this window — a fixed automated probe, not real work)</div>`;
+}
+
+function renderPatterns(patterns) {
+  const el = $('patternList');
+  if (!patterns.length) { el.innerHTML = '<div style="color:var(--dim);font-size:10px;padding:8px">No patterns detected.</div>'; return; }
+  el.innerHTML = patterns.map(p => `
+    <div class="pattern-item ${p.severity}">
+      <span class="pattern-sev">${p.severity}</span>
+      <div>
+        <div class="pattern-desc">${p.description}</div>
+        <div class="pattern-time">${fmtTime(p.timestamp)} · ${p.pattern_type}</div>
+      </div>
+    </div>`).join('');
+}
+
+function renderMetricsTables(summary) {
+  const modelBody = $('modelTable').querySelector('tbody');
+  modelBody.innerHTML = summary.by_model.length ? summary.by_model.map(r => `
+    <tr><td>${r.model_or_service}</td><td>${r.request_count}</td>
+    <td>${r.avg_latency_ms ? r.avg_latency_ms.toFixed(0)+'ms' : '—'}</td>
+    <td class="${r.error_count ? 'hw-warn' : ''}">${r.error_count}</td></tr>`).join('')
+    : '<tr class="empty-row"><td colspan="4">No requests yet.</td></tr>';
+
+  const callerBody = $('callerTable').querySelector('tbody');
+  callerBody.innerHTML = summary.by_caller.length ? summary.by_caller.map(r => `
+    <tr><td>${r.client_ip}</td><td>${r.request_count}</td>
+    <td>${r.avg_latency_ms ? r.avg_latency_ms.toFixed(0)+'ms' : '—'}</td>
+    <td class="${r.errors ? 'hw-warn' : ''}">${r.errors}</td></tr>`).join('')
+    : '<tr class="empty-row"><td colspan="4">No requests yet.</td></tr>';
+}
+
+let connChart = null;
+function renderConnChart(samples) {
+  const byTime = {};
+  for (const s of samples) {
+    const bucket = Math.floor(s.timestamp / 30) * 30;
+    byTime[bucket] = Math.max(byTime[bucket] || 0, s.established_count);
+  }
+  const labels = Object.keys(byTime).sort((a,b)=>a-b);
+  const values = labels.map(l => byTime[l]);
+  const labelStrs = labels.map(l => new Date(l*1000).toLocaleTimeString());
+
+  if (!connChart) {
+    connChart = new Chart($('connChart'), {
+      type: 'line',
+      data: { labels: labelStrs, datasets: [{
+        label: 'Established connections', data: values,
+        borderColor: '#c8681e', backgroundColor: 'rgba(200,104,30,.1)',
+        fill: true, tension: 0.2, pointRadius: 0,
+      }]},
+      options: {
+        responsive: true,
+        scales: {
+          x: { ticks: { color: '#575350', maxTicksLimit: 8 }, grid: { color: '#1f1e1d' } },
+          y: { ticks: { color: '#575350' }, grid: { color: '#1f1e1d' }, beginAtZero: true }
+        },
+        plugins: { legend: { display: false } }
+      }
+    });
+  } else {
+    connChart.data.labels = labelStrs;
+    connChart.data.datasets[0].data = values;
+    connChart.update('none');
+  }
+}
+
+async function refreshAll() {
+  try {
+    const [status, cycles, hw, gpus, tasks, conns, patterns, summary] = await Promise.all([
+      getJSON('/api/health_status'),
+      getJSON('/api/load_cycles?limit=200'),
+      getJSON('/api/gpu_hardware'),
+      getJSON('/api/gpus'),
+      getJSON('/api/task_samples?window_seconds=3600'),
+      getJSON('/api/connections?window_seconds=1800'),
+      getJSON('/api/patterns?limit=30'),
+      getJSON('/api/metrics/summary?window_seconds=3600'),
+    ]);
+    renderHero(status);
+    renderGauges(status);
+    renderTimeline(cycles);
+    renderHardware(hw);
+    renderLoadStrip(gpus);
+    renderTaskSummary(tasks);
+    renderConnChart(conns);
+    renderPatterns(patterns);
+    renderMetricsTables(summary);
+  } catch (e) {
+    console.error('refresh failed', e);
+  }
+}
+
+function tickClock() {
+  $('clock').textContent = new Date().toLocaleTimeString();
+}
+setInterval(tickClock, 1000);
+tickClock();
+
+refreshAll();
+setInterval(refreshAll, 5000);
+
+// WebSocket for the live dot only — polling drives the actual render to
+// keep this simple and deterministic for testing; the socket just proves
+// the collector loop is alive.
+try {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => $('wsDot').classList.add('live');
+  ws.onclose = () => $('wsDot').classList.remove('live');
+  ws.onerror = () => $('wsDot').classList.remove('live');
+} catch (e) { console.warn('ws unavailable', e); }
+</script>
+</body>
+</html>
