@@ -134,7 +134,7 @@ ollama:
     - name: "gpu-unified"
       port: 18434                # Ollama's real (internal-only) bind
       public_port: 11434         # what LAN clients actually connect to
-      gpu_ids: [1, 2, 3, 4, 5, 6]
+      gpu_ids: [1, 2]
       model: "qwen3-coder-next:Q4_K_M"
       systemd_service: "ollama-unified.service"
     - name: "meta"
