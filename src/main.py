@@ -82,6 +82,18 @@ connections_collector: ConnectionsCollector = ConnectionsCollector()
 gpu_hardware_collector: GPUHardwareCollector = GPUHardwareCollector()
 ws_connections: List[WebSocket] = []
 STARTED_AT: float = time.time()
+# Guards the prompt-summarizer against exactly the kind of overload it can
+# itself cause -- OLLAMA_NUM_PARALLEL=1 on every summarizer service
+# configured so far means it can only truly work on one call at a time. A
+# burst of mirrored prompts fires one independent asyncio.create_task per
+# prompt; queueing the rest behind a semaphore just delays the pileup
+# instead of fixing it (each waiting task still holds real memory/asyncio
+# state, and by the time its turn comes the summary may be pointless).
+# Instead: if the summarizer is already busy, skip immediately and leave
+# the mechanical-truncation fallback in place -- never queue. Plain bool,
+# not a lock/semaphore: single-threaded asyncio event loop, no `await`
+# between the check and the set, so there's no race to guard against.
+SUMMARIZER_BUSY = False
 
 
 async def broadcast_ws(message: Dict[str, Any]):
@@ -859,18 +871,30 @@ async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
     summarizer = settings.get_ollama_service(cfg.summarizer_service) if cfg.summarizer_service else None
     if not summarizer:
         return
+    global SUMMARIZER_BUSY
+    if SUMMARIZER_BUSY:
+        return  # already working on another prompt -- skip, leave the mechanical fallback in place
     instruction = (
         f"Summarize the following prompt in one or two plain sentences, at most "
         f"{cfg.fallback_max_chars} characters, describing what is being asked for. "
         "No code, no markdown, no diffs, no quotes -- plain text only, and never "
         "repeat any of the prompt's own text verbatim:\n\n" + prompt_text[:4000]
     )
+    SUMMARIZER_BUSY = True
     try:
         async with httpx.AsyncClient(timeout=cfg.summarizer_timeout_seconds) as client:
             resp = await client.post(
                 f"http://127.0.0.1:{summarizer.port}/api/generate",
                 json={"model": summarizer.model, "prompt": instruction, "stream": False,
-                      "options": {"num_predict": 80}},
+                      # num_ctx pinned -- left to Ollama's auto-sizing (based on prompt
+                      # length), every request could pick a different context size, and
+                      # with OLLAMA_MAX_LOADED_MODELS=1 every size change forces a full
+                      # model reload. Observed live: alternating short/long mirrored
+                      # prompts flipped this between 4096 and 32768 on nearly every call
+                      # (~2s reload each) -- exactly what put this service into DEGRADED
+                      # via ctx_churn. 4096 comfortably covers instruction +
+                      # prompt_text[:4000] + the num_predict budget below.
+                      "options": {"num_predict": 80, "num_ctx": 4096}},
             )
         resp.raise_for_status()
         raw = resp.json().get("response", "")
@@ -881,6 +905,8 @@ async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
             upgrade_ring_row("prompt_summaries", row_id, timestamp, {"summary": summary, "source": "llm"})
     except Exception as e:
         print(f"Prompt summarizer error: {e}")
+    finally:
+        SUMMARIZER_BUSY = False
 
 
 @app.post("/api/prompt_mirror")
