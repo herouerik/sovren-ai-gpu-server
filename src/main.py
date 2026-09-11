@@ -769,18 +769,29 @@ def _extract_prompt_text(endpoint: str, body: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _looks_like_verbatim_echo(text: str) -> bool:
+    """Reject LLM output that's clearly not a summary. Observed live on this
+    box: small models asked to summarize a diff- or JSON-shaped prompt often
+    slip into completion mode and echo/continue the input instead of
+    describing it -- a code fence or embedded newline is a reliable tell
+    (a real 8-word imperative summary is always a single plain-text line)."""
+    return "```" in text or "\n" in text.strip()
+
+
 async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
     """Runs as a fire-and-forget background task -- never blocks the mirror
-    response. Failure (summarizer not running, timeout, bad output) just
-    means the mechanical placeholder ring_insert() already wrote stays put;
-    there's nothing to roll back."""
+    response. Failure (summarizer not running, timeout, bad/echoed output)
+    just means the mechanical placeholder ring_insert() already wrote stays
+    put; there's nothing to roll back."""
     cfg = settings.prompt_insight
     summarizer = settings.get_ollama_service(cfg.summarizer_service) if cfg.summarizer_service else None
     if not summarizer:
         return
     instruction = (
         "Summarize the following prompt in at most 8 words, imperative style, "
-        "no trailing punctuation, no quotes:\n\n" + prompt_text[:4000]
+        "no trailing punctuation, no quotes, no code, no markdown, no diffs -- "
+        "plain text only, describing what is being asked for, never repeating "
+        "any of the prompt's own text verbatim:\n\n" + prompt_text[:4000]
     )
     try:
         async with httpx.AsyncClient(timeout=cfg.summarizer_timeout_seconds) as client:
@@ -790,7 +801,10 @@ async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
                       "options": {"num_predict": 24}},
             )
         resp.raise_for_status()
-        summary = _truncate_to_words(resp.json().get("response", ""), cfg.fallback_max_words, cfg.fallback_max_chars)
+        raw = resp.json().get("response", "")
+        if _looks_like_verbatim_echo(raw):
+            return  # model echoed/continued the input -- leave the mechanical fallback in place
+        summary = _truncate_to_words(raw, cfg.fallback_max_words, cfg.fallback_max_chars)
         if summary and summary != "(empty prompt)":
             upgrade_ring_row("prompt_summaries", row_id, timestamp, {"summary": summary, "source": "llm"})
     except Exception as e:

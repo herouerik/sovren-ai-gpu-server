@@ -66,7 +66,7 @@ server:
 # snippet. Off by default; harmless to leave on with no mirror configured
 # (nothing ever arrives, so nothing is stored).
 prompt_insight:
-  enabled: false
+  enabled: true
   # Name of an entry in ollama.services to ask for a real ~8-word summary
   # instead of mechanical truncation -- "meta" here is this box's otherwise-
   # idle GPU 0, dedicated to this so it never competes with real inference.
