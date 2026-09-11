@@ -818,13 +818,32 @@ def _extract_prompt_text(endpoint: str, body: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _looks_like_verbatim_echo(text: str) -> bool:
+def _looks_like_verbatim_echo(text: str, prompt_text: str) -> bool:
     """Reject LLM output that's clearly not a summary. Observed live on this
     box: small models asked to summarize a diff- or JSON-shaped prompt often
     slip into completion mode and echo/continue the input instead of
-    describing it -- a code fence or embedded newline is a reliable tell
-    (a real 8-word imperative summary is always a single plain-text line)."""
-    return "```" in text or "\n" in text.strip()
+    describing it. Two tells:
+    - structural: a code fence or embedded newline -- a real one-or-two-
+      sentence summary is always plain single-line text.
+    - content: the output is itself a long verbatim substring of the
+      prompt it was asked to summarize. Catches single-line echoes a code
+      fence/newline check misses entirely -- observed live: given a diff-
+      shaped prompt, the model echoed just its filename line back
+      ("diff -u tests/test_x.py.orig tests/test_x.py"), one line, no
+      fence, so the structural check alone let it straight through.
+    20 chars is deliberately short -- a genuine summary reusing a filename
+    or a few words from the prompt is normal and fine; this is aimed at
+    "the whole output is a chunk of the input," not "shares vocabulary
+    with it." A false positive here just means falling back to the
+    mechanical truncation, which is already a reasonable result on its
+    own -- not something worth tuning finer than this.
+    """
+    stripped = text.strip()
+    if "```" in stripped or "\n" in stripped:
+        return True
+    if len(stripped) >= 20 and stripped in prompt_text:
+        return True
+    return False
 
 
 async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
@@ -851,7 +870,7 @@ async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
             )
         resp.raise_for_status()
         raw = resp.json().get("response", "")
-        if _looks_like_verbatim_echo(raw):
+        if _looks_like_verbatim_echo(raw, prompt_text):
             return  # model echoed/continued the input -- leave the mechanical fallback in place
         summary = _truncate_to_words(raw, cfg.fallback_max_words, cfg.fallback_max_chars)
         if summary and summary != "(empty prompt)":
