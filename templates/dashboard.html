@@ -32,7 +32,8 @@ a{color:inherit}
 
 .topbar{height:44px;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 18px;gap:16px;position:sticky;top:0;background:var(--bg);z-index:10}
 .topbar-brand{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent)}
-.topbar-clock{margin-left:auto;font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+.topbar-clock{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+.topbar-uptime{margin-left:auto;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
 .ws-dot{width:6px;height:6px;border-radius:50%;background:var(--muted)}
 .ws-dot.live{background:var(--green);animation:blink 2s ease-in-out infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
@@ -124,6 +125,15 @@ table.data tr:hover td{background:var(--surf2)}
 .pattern-desc{font-size:10px;color:var(--text)}
 .pattern-time{font-size:8px;color:var(--muted);margin-top:2px}
 
+/* RECENT PROMPTS -- one line each, never wraps, always ellipsized */
+.prompt-list{display:flex;flex-direction:column;gap:1px;max-height:320px;overflow-y:auto}
+.prompt-item{padding:6px 10px;display:flex;gap:10px;align-items:center;background:var(--surf2)}
+.prompt-time{font-size:8px;color:var(--muted);flex-shrink:0;width:56px;font-variant-numeric:tabular-nums}
+.prompt-svc{font-size:8px;color:var(--dim);flex-shrink:0;width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prompt-text{font-size:10px;color:var(--text);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prompt-item.truncated .prompt-text{color:var(--dim)}
+.prompt-src{font-size:7px;color:var(--muted);flex-shrink:0;text-transform:uppercase;letter-spacing:.06em}
+
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 @media (max-width:900px){.two-col{grid-template-columns:1fr}}
 
@@ -135,6 +145,7 @@ canvas{max-width:100%}
 <div class="topbar">
   <div class="ws-dot" id="wsDot"></div>
   <div class="topbar-brand">Sovren · GPU Ollama Monitor</div>
+  <div class="topbar-uptime" id="uptime"></div>
   <div class="topbar-clock" id="clock">—</div>
 </div>
 
@@ -218,6 +229,11 @@ canvas{max-width:100%}
     </div>
   </div>
 
+  <div class="section">
+    <div class="section-head"><span class="section-title">Recent Prompts</span></div>
+    <div class="section-body"><div class="prompt-list" id="promptList"></div></div>
+  </div>
+
 </div>
 
 <script>
@@ -230,6 +246,12 @@ const fmtDuration = (s) => {
   return (s/3600).toFixed(1) + 'h';
 };
 const fmtTime = (ts) => ts ? new Date(ts*1000).toLocaleTimeString() : '—';
+const fmtSince = (ts) => {
+  const d = new Date(ts*1000);
+  const pad = (n) => String(n).padStart(2,'0');
+  const yy = String(d.getFullYear()).slice(-2);
+  return `${yy}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
 const fmtCountdown = (ts) => {
   if (!ts) return '—';
   const diff = ts - Date.now()/1000;
@@ -389,6 +411,18 @@ function renderPatterns(patterns) {
     </div>`).join('');
 }
 
+function renderPrompts(prompts) {
+  const el = $('promptList');
+  if (!prompts.length) { el.innerHTML = '<div style="color:var(--dim);font-size:10px;padding:8px">No prompts captured yet — requires a reverse-proxy mirror, see README.</div>'; return; }
+  el.innerHTML = prompts.map(p => `
+    <div class="prompt-item ${p.source}">
+      <span class="prompt-time">${fmtTime(p.timestamp)}</span>
+      <span class="prompt-svc">${p.service_name}${p.model ? ' · ' + p.model : ''}</span>
+      <span class="prompt-text" title="${p.summary.replace(/"/g,'&quot;')}">${p.summary}</span>
+      <span class="prompt-src">${p.source === 'llm' ? 'AI' : 'raw'}</span>
+    </div>`).join('');
+}
+
 function renderMetricsTables(summary) {
   const modelBody = $('modelTable').querySelector('tbody');
   modelBody.innerHTML = summary.by_model.length ? summary.by_model.map(r => `
@@ -442,7 +476,7 @@ function renderConnChart(samples) {
 
 async function refreshAll() {
   try {
-    const [status, cycles, hw, gpus, tasks, conns, patterns, summary] = await Promise.all([
+    const [status, cycles, hw, gpus, tasks, conns, patterns, summary, prompts] = await Promise.all([
       getJSON('/api/health_status'),
       getJSON('/api/load_cycles?limit=200'),
       getJSON('/api/gpu_hardware'),
@@ -451,6 +485,7 @@ async function refreshAll() {
       getJSON('/api/connections?window_seconds=1800'),
       getJSON('/api/patterns?limit=30'),
       getJSON('/api/metrics/summary?window_seconds=3600'),
+      getJSON('/api/prompt_summaries?limit=20'),
     ]);
     renderHero(status);
     renderGauges(status);
@@ -461,6 +496,7 @@ async function refreshAll() {
     renderConnChart(conns);
     renderPatterns(patterns);
     renderMetricsTables(summary);
+    renderPrompts(prompts);
   } catch (e) {
     console.error('refresh failed', e);
   }
@@ -471,6 +507,10 @@ function tickClock() {
 }
 setInterval(tickClock, 1000);
 tickClock();
+
+getJSON('/health').then(h => {
+  $('uptime').textContent = 'monitoring since ' + fmtSince(h.started_at);
+}).catch(() => {});
 
 refreshAll();
 setInterval(refreshAll, 5000);

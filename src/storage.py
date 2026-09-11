@@ -196,6 +196,24 @@ def _init_schema(db: sqlite3.Connection):
 
         CREATE INDEX IF NOT EXISTS idx_task_samples_timestamp ON task_samples(timestamp);
 
+        -- Fixed-capacity ring, same scheme as `requests`. Deliberately never
+        -- stores the raw prompt/response body -- only a short (<= ~8-word)
+        -- derived summary, mechanical or LLM-generated (see
+        -- main.py:prompt_mirror). This is inference traffic that can carry
+        -- proprietary source or secrets; the full body only ever exists
+        -- transiently in-process for the duration of one request.
+        CREATE TABLE IF NOT EXISTS prompt_summaries (
+            id INTEGER PRIMARY KEY,
+            timestamp REAL NOT NULL,
+            service_name TEXT NOT NULL,
+            model TEXT,
+            endpoint TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            source TEXT NOT NULL  -- 'llm' | 'truncated'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_prompt_summaries_timestamp ON prompt_summaries(timestamp);
+
         -- Manually-triggered benchmark runs -- naturally low volume, same
         -- day-slot retention as patterns/load_cycles for consistency (no
         -- separate cleanup path to maintain).
@@ -283,6 +301,23 @@ def ring_insert(table: str, data: Dict[str, Any], capacity: int) -> int:
     db.execute(f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})", tuple(row.values()))
     db.commit()
     return row_id
+
+
+def upgrade_ring_row(table: str, row_id: int, timestamp: float, data: Dict[str, Any]) -> None:
+    """Update a row previously written by ring_insert(), guarded by the
+    timestamp it was written with -- if the ring wrapped around and that
+    slot was already overwritten by a newer row before this update arrives
+    (only possible under very high write volume), the guard makes this a
+    silent no-op instead of corrupting the newer row. Used to upgrade a
+    ring_insert's synchronous placeholder with a slower async result (e.g.
+    an LLM-generated prompt summary replacing the mechanical fallback)."""
+    set_cols = ", ".join(f"{k} = ?" for k in data.keys())
+    db = get_db()
+    db.execute(
+        f"UPDATE {table} SET {set_cols} WHERE id = ? AND timestamp = ?",
+        (*data.values(), row_id, timestamp),
+    )
+    db.commit()
 
 
 def day_bucket_insert(table: str, data: Dict[str, Any], timestamp: float, retention_days: int) -> int:

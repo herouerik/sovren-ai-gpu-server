@@ -21,6 +21,9 @@ whether the box is actually healthy right now — not just a metrics dump.
 - **Pattern detection**: reload storms, load-cancel timeout cascades, context-size
   churn, near-zero keep_alive evictions, connection pileups, latency spikes, delete
   attempts, quota/rate-limit signals, GPU starvation, GPU hardware faults, CPU spillover
+- **Prompt insight** *(opt-in, see [Prompt insight](#prompt-insight))*: one-line,
+  ~8-word summaries of the most recent prompts — mechanical by default, or a real
+  summary from a small local model if you point one at it
 - **Dashboard**: single-page, health-first layout — a hero status card, a color-coded
   load-cycle timeline, a GPU hardware checklist, live compute strip, and alerts
 
@@ -41,6 +44,8 @@ whether the box is actually healthy right now — not just a metrics dump.
 |  +- /api/gpus            -> Live GPU load state (NVML)                  |
 |  +- /api/ollama          -> Ollama service state (/api/ps, /tags)       |
 |  +- /api/patterns        -> Detected anomalies & patterns               |
+|  +- /api/prompt_summaries-> Recent one-line prompt summaries (opt-in)   |
+|  +- /api/prompt_mirror   -> Reverse-proxy mirror target (opt-in)        |
 |  +- /ws                  -> WebSocket for live updates                  |
 +-------------------------------------------------------------------------+
 |  Background Collectors                                                  |
@@ -61,6 +66,7 @@ whether the box is actually healthy right now — not just a metrics dump.
 |  +- gpu_samples                -> in-memory only, never persisted (*)  |
 |  +- ollama_state table        -> latest-only upsert, one row/service   |
 |  +- patterns table            -> detected anomalies, 14-day day-slots  |
+|  +- prompt_summaries table    -> summaries only, fixed ring (opt-in)   |
 +-------------------------------------------------------------------------+
 ```
 (*) See "Storage retention" below -- src/storage.py's module docstring has
@@ -177,6 +183,14 @@ patterns:
 server:
   host: "0.0.0.0"  # currently unused, see Requirements
   port: 8082        # currently unused, see Requirements
+
+prompt_insight:      # see "Prompt insight" below -- off by default
+  enabled: false
+  summarizer_service: "meta"
+  summarizer_timeout_seconds: 20
+  fallback_max_words: 8
+  fallback_max_chars: 100
+  ring_capacity: 100
 ```
 
 A service's `enabled: false` flag matters: patterns and the hero status card
@@ -219,6 +233,75 @@ table uses whichever of these fits the data:
 See `src/storage.py`'s module docstring and the `ring_insert` /
 `day_bucket_insert` / `connection_bucket_upsert` / `upsert` helpers for the
 exact mechanism each table uses.
+
+### Prompt insight
+
+The "Recent Prompts" dashboard panel needs to know what a request actually
+said, and this app has no access to that on its own — confirmed live
+against this box's real journald output, Ollama's logs never contain
+prompt/response content at any verbosity, only access-log lines and
+slot-timing metadata. The only way to see it is to have something in the
+traffic path hand this app a copy.
+
+**Off by default** (`prompt_insight.enabled: false`) and harmless to leave
+on with nothing configured — `/api/prompt_mirror` just never receives
+anything, so nothing is ever stored.
+
+**How to turn it on** — add an nginx `mirror` directive to whatever already
+proxies to Ollama. This sends a non-blocking *copy* of each request; nginx
+discards the copy's response, so it never adds latency to the real request
+and never affects reliability if this app is down. Example, extending the
+DELETE-guard proxy from [Configuration](#configuration):
+
+```nginx
+server {
+    listen 11434;
+
+    location / {
+        if ($request_method = DELETE) { return 403 "deletes disabled on this endpoint\n"; }
+        mirror /mirror-to-monitor;
+        mirror_request_body on;
+        proxy_pass http://127.0.0.1:18434;
+        # ...existing proxy_set_header / timeout / buffering directives...
+    }
+
+    # Fire-and-forget copy, fixed target regardless of the original path --
+    # the ingestion endpoint reads the real path from X-Original-URI instead.
+    location = /mirror-to-monitor {
+        internal;
+        proxy_pass http://127.0.0.1:8082/api/prompt_mirror;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Service-Name "gpu-unified";  # match the service's `name` in config.yaml
+    }
+}
+```
+
+Then `sudo nginx -t && sudo systemctl reload nginx`, and set
+`prompt_insight.enabled: true` in `config.yaml` (requires restarting this
+app — YAML config is only read at startup).
+
+**Summarization** — every mirrored prompt gets a mechanical fallback first
+(first `fallback_max_words` words / `fallback_max_chars` chars, whichever
+is shorter, stored immediately, synchronously). If
+`prompt_insight.summarizer_service` names a reachable entry in
+`ollama.services`, a background task then asks it for a real ~8-word
+summary and upgrades the stored row in place — this never blocks the
+mirror response, and a summarizer that's unset, unreachable, or slow just
+means every prompt stays on the mechanical fallback, silently, no error.
+Point it at hardware that isn't part of your real inference pool if you
+have any (an otherwise-idle GPU, a CPU-only Ollama instance) — pointing it
+at the same pool being monitored means summarization competes with real
+inference for capacity, and can time out under load (observed directly
+while building this: a real generate call to the busy production pool on
+this box timed out at 20s with zero bytes back).
+
+**Privacy** — this only ever stores the derived summary (max ~8 words),
+never the raw prompt or response body. The full body exists only
+transiently, in-process, for the duration of one mirrored request. This
+matters because inference traffic through a coding-agent pool can carry
+proprietary source or secrets; don't widen `_extract_prompt_text` in
+`src/main.py` to persist more than that without thinking through what
+you're now storing at rest.
 
 ## Data Schema
 
@@ -332,6 +415,8 @@ upserts, one row per GPU/service. See `src/storage.py` for exact columns and the
 | `GET /api/gpus` | Current GPU load state |
 | `GET /api/ollama/services` | Ollama service status & loaded models |
 | `GET /api/patterns` | Detected anomalies |
+| `GET /api/prompt_summaries` | Recent one-line prompt summaries (see [Prompt insight](#prompt-insight)) |
+| `POST /api/prompt_mirror` | Reverse-proxy mirror target — not for direct use, see [Prompt insight](#prompt-insight) |
 | `WS /ws` | Live updates (GPU samples, connections, lifecycle events, patterns) |
 
 ## Dashboard
@@ -347,6 +432,11 @@ Open `http://localhost:8082` — single-page, health-first layout:
 - **Connections chart** — established-connection count over time
 - **Real work vs. heartbeat** — how much of recent traffic is genuine vs. a health probe
 - **Patterns & alerts**, **requests by model/service**, **requests by caller IP**
+- **Recent prompts** — scrollable, one-line-each summaries of the last 20 prompts
+  (empty until [Prompt insight](#prompt-insight) is configured)
+- **Header** — live clock plus "monitoring since" (this process's own start time,
+  not the history depth of any individual table — see [Storage retention](#storage-retention)
+  for what each table actually covers)
 
 ## Development
 

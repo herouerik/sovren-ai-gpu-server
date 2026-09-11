@@ -62,8 +62,13 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+import httpx
+
 from src.config import settings
-from src.storage import get_db, execute, query_all, query_one, ring_insert, latest_gpu_samples, query_gpu_samples
+from src.storage import (
+    get_db, execute, query_all, query_one, ring_insert, upgrade_ring_row,
+    latest_gpu_samples, query_gpu_samples,
+)
 from src.collectors import GPUCollector, OllamaStateCollector, LogTailer, ConnectionsCollector, GPUHardwareCollector
 from src.lifecycle import get_tracker
 from src.patterns import analyze_and_store
@@ -75,6 +80,7 @@ log_tailer: LogTailer = LogTailer()
 connections_collector: ConnectionsCollector = ConnectionsCollector()
 gpu_hardware_collector: GPUHardwareCollector = GPUHardwareCollector()
 ws_connections: List[WebSocket] = []
+STARTED_AT: float = time.time()
 
 
 async def broadcast_ws(message: Dict[str, Any]):
@@ -717,6 +723,121 @@ async def acknowledge_pattern(pattern_id: int):
     return {"ok": True}
 
 
+# =============================================================================
+# PROMPT INSIGHT — recent-prompts panel
+# =============================================================================
+#
+# This app never sees request bodies on its own -- Ollama's own logs never
+# contain them, at any verbosity (confirmed live against this box's actual
+# journald output). /api/prompt_mirror exists to receive a non-blocking
+# COPY of each request from a reverse proxy's `mirror` directive (see
+# README "Prompt insight"). The proxy discards whatever this endpoint
+# returns, so it never affects real request latency or reliability -- if
+# this app is down, real traffic is entirely unaffected.
+#
+# Deliberately never stores the raw prompt/response body -- only a short
+# derived summary (mechanical truncation, or a real ~8-word summary from
+# `prompt_insight.summarizer_service` if configured and reachable). This is
+# inference traffic that can carry proprietary source or secrets; the full
+# body only ever exists transiently in-process for one request.
+
+def _truncate_to_words(text: str, max_words: int, max_chars: int) -> str:
+    text = " ".join(text.split())
+    if not text:
+        return "(empty prompt)"
+    words = text.split(" ")
+    was_word_truncated = len(words) > max_words
+    truncated = " ".join(words[:max_words])
+    was_char_truncated = len(truncated) > max_chars
+    if was_char_truncated:
+        truncated = truncated[:max_chars].rstrip()
+    if was_word_truncated or was_char_truncated:
+        truncated += "…"
+    return truncated
+
+
+def _extract_prompt_text(endpoint: str, body: Dict[str, Any]) -> Optional[str]:
+    if endpoint.endswith("/api/generate"):
+        return body.get("prompt")
+    if endpoint.endswith("/api/chat"):
+        messages = body.get("messages") or []
+        for m in reversed(messages):
+            if m.get("role") == "user" and m.get("content"):
+                return m["content"]
+        if messages:
+            return messages[-1].get("content")
+    return None
+
+
+async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
+    """Runs as a fire-and-forget background task -- never blocks the mirror
+    response. Failure (summarizer not running, timeout, bad output) just
+    means the mechanical placeholder ring_insert() already wrote stays put;
+    there's nothing to roll back."""
+    cfg = settings.prompt_insight
+    summarizer = settings.get_ollama_service(cfg.summarizer_service) if cfg.summarizer_service else None
+    if not summarizer:
+        return
+    instruction = (
+        "Summarize the following prompt in at most 8 words, imperative style, "
+        "no trailing punctuation, no quotes:\n\n" + prompt_text[:4000]
+    )
+    try:
+        async with httpx.AsyncClient(timeout=cfg.summarizer_timeout_seconds) as client:
+            resp = await client.post(
+                f"http://127.0.0.1:{summarizer.port}/api/generate",
+                json={"model": summarizer.model, "prompt": instruction, "stream": False,
+                      "options": {"num_predict": 24}},
+            )
+        resp.raise_for_status()
+        summary = _truncate_to_words(resp.json().get("response", ""), cfg.fallback_max_words, cfg.fallback_max_chars)
+        if summary and summary != "(empty prompt)":
+            upgrade_ring_row("prompt_summaries", row_id, timestamp, {"summary": summary, "source": "llm"})
+    except Exception as e:
+        print(f"Prompt summarizer error: {e}")
+
+
+@app.post("/api/prompt_mirror")
+async def prompt_mirror(request: Request):
+    """Receives a mirrored copy of a real request from the reverse proxy.
+    Always returns fast -- summarization (if configured) happens in a
+    background task, never blocking this response."""
+    if not settings.prompt_insight.enabled:
+        return {"ok": True}
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": True}  # not JSON (e.g. a mirrored GET /api/tags) -- nothing to summarize
+
+    endpoint = request.headers.get("x-original-uri", request.url.path)
+    service_name = request.headers.get("x-service-name", "unknown")
+    prompt_text = _extract_prompt_text(endpoint, body)
+    if not prompt_text:
+        return {"ok": True}
+
+    cfg = settings.prompt_insight
+    timestamp = time.time()
+    row_id = ring_insert("prompt_summaries", {
+        "timestamp": timestamp,
+        "service_name": service_name,
+        "model": body.get("model"),
+        "endpoint": endpoint,
+        "summary": _truncate_to_words(prompt_text, cfg.fallback_max_words, cfg.fallback_max_chars),
+        "source": "truncated",
+    }, capacity=cfg.ring_capacity)
+
+    if cfg.summarizer_service:
+        asyncio.create_task(_summarize_via_llm(row_id, timestamp, prompt_text))
+
+    return {"ok": True}
+
+
+@app.get("/api/prompt_summaries")
+async def get_prompt_summaries(limit: int = Query(20, le=200)):
+    rows = execute("SELECT * FROM prompt_summaries ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -737,6 +858,7 @@ async def health():
     return {
         "status": "ok",
         "timestamp": time.time(),
+        "started_at": STARTED_AT,
         "collectors": {
             "gpu": gpu_collector._initialized,
             "ollama": True,

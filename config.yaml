@@ -58,3 +58,22 @@ server:
   host: "0.0.0.0"
   port: 8082
   cors_origins: ["*"]
+
+# Recent-prompts panel: this monitor never sees request bodies on its own
+# (Ollama's own logs never contain them, at any verbosity) -- it requires a
+# reverse proxy to mirror a non-blocking copy of each request to
+# /api/prompt_mirror. See README "Prompt insight" for the nginx `mirror`
+# snippet. Off by default; harmless to leave on with no mirror configured
+# (nothing ever arrives, so nothing is stored).
+prompt_insight:
+  enabled: false
+  # Name of an entry in ollama.services to ask for a real ~8-word summary
+  # instead of mechanical truncation -- "meta" here is this box's otherwise-
+  # idle GPU 0, dedicated to this so it never competes with real inference.
+  # Not running or not configured: every prompt just falls back to
+  # mechanical truncation, silently, no error.
+  summarizer_service: "meta"
+  summarizer_timeout_seconds: 20
+  fallback_max_words: 8
+  fallback_max_chars: 100
+  ring_capacity: 100

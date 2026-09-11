@@ -79,6 +79,25 @@ class PatternsConfig(BaseSettings):
     model_config = SettingsConfigDict(extra="allow")
 
 
+class PromptInsightConfig(BaseSettings):
+    # Off by default: requires a reverse proxy mirroring requests to
+    # /api/prompt_mirror (see README "Prompt insight") -- without that
+    # nothing ever arrives here regardless of this flag.
+    enabled: bool = False
+    # Name of an entry in ollama.services to ask for a real ~8-word
+    # summary (e.g. an otherwise-idle GPU dedicated to this). Looked up by
+    # port only, independent of that service's own `enabled` flag -- not
+    # reachable or not configured both just mean every prompt falls back
+    # to mechanical truncation, no error.
+    summarizer_service: Optional[str] = None
+    summarizer_timeout_seconds: float = 20.0
+    fallback_max_words: int = 8
+    fallback_max_chars: int = 100
+    ring_capacity: int = 100
+
+    model_config = SettingsConfigDict(extra="allow")
+
+
 class ServerConfig(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
@@ -104,6 +123,7 @@ class Settings(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     patterns: PatternsConfig = Field(default_factory=PatternsConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
+    prompt_insight: PromptInsightConfig = Field(default_factory=PromptInsightConfig)
 
     model_config = SettingsConfigDict(extra="allow")
 
@@ -115,6 +135,9 @@ class Settings(BaseSettings):
     def get_ollama_services(self) -> List[OllamaServiceConfig]:
         services = self.ollama.get("services", [])
         return [OllamaServiceConfig(**s) for s in services]
+
+    def get_ollama_service(self, name: str) -> Optional[OllamaServiceConfig]:
+        return next((s for s in self.get_ollama_services() if s.name == name), None)
 
 
 settings = Settings()
