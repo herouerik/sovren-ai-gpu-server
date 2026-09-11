@@ -469,3 +469,29 @@ def query_gpu_samples(cutoff: float = 0.0) -> List[Dict[str, Any]]:
 
 def latest_gpu_samples() -> List[Dict[str, Any]]:
     return [dq[-1] for dq in _gpu_memory.values() if dq]
+
+
+# ---------------------------------------------------------------------------
+# Raw prompt text, for the "Recent Prompts" hover tooltip -- in memory only,
+# never written to data/monitor.db. This is a deliberate, narrow exception
+# to prompt_summaries' "never store the raw body" rule (see its table
+# comment): it exists purely so a person looking at a mysterious summary
+# can hover to see what actually produced it, bounded by the same ring
+# capacity as prompt_summaries itself and gone entirely on restart -- never
+# durable, never queryable, never in a backup. A 4000-char cap per entry
+# keeps memory use trivial regardless of how large a mirrored request is.
+# ---------------------------------------------------------------------------
+
+_raw_prompt_cache: Dict[int, tuple] = {}  # row_id -> (timestamp, text)
+_RAW_PROMPT_MAX_CHARS = 4000
+
+
+def cache_raw_prompt(row_id: int, timestamp: float, text: str) -> None:
+    _raw_prompt_cache[row_id] = (timestamp, text[:_RAW_PROMPT_MAX_CHARS])
+
+
+def get_raw_prompt(row_id: int, timestamp: float) -> Optional[str]:
+    cached = _raw_prompt_cache.get(row_id)
+    if cached is None or cached[0] != timestamp:
+        return None  # evicted by ring wraparound, or never cached (e.g. before a restart)
+    return cached[1]

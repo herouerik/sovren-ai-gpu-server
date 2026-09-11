@@ -453,6 +453,28 @@ function fmtPromptMetricsTitle(p) {
   return `${p.total_tokens ?? '—'} tokens · TTFT ${p.ttft_ms.toFixed(0)}ms · prefill ${prefill} tok/s · decode ${p.decode_tps?.toFixed(1) ?? '—'} tok/s`;
 }
 
+async function showRawPromptOnHover(el, id, ts) {
+  // Fetched lazily, once per element -- the raw text lives only in the
+  // server's memory (never data/monitor.db, see storage.cache_raw_prompt),
+  // so this is the one place it's ever requested, and only when someone
+  // actually wants to see what a mysterious summary came from. A real
+  // newline in a `title` attribute renders as a line break in the native
+  // hover tooltip, no custom widget needed.
+  if (el.dataset.rawFetched) return;
+  el.dataset.rawFetched = '1';
+  try {
+    const r = await fetch(`/api/prompt_raw/${id}?timestamp=${ts}`);
+    if (r.ok) {
+      const data = await r.json();
+      el.title = data.text;
+    }
+    // 404 (evicted by ring wraparound, or predates the last restart) --
+    // leave the summary-text title already in place.
+  } catch (e) {
+    el.dataset.rawFetched = '';  // network hiccup -- allow retry on next hover
+  }
+}
+
 function renderPrompts(prompts) {
   const el = $('promptList');
   if (!prompts.length) { el.innerHTML = '<div style="color:var(--dim);font-size:10px;padding:8px">No prompts captured yet — requires a reverse-proxy mirror, see README.</div>'; return; }
@@ -461,7 +483,8 @@ function renderPrompts(prompts) {
       <span class="prompt-time">${fmtTime(p.timestamp)}</span>
       <span class="prompt-svc">${p.service_name}${p.model ? ' · ' + p.model : ''}</span>
       <span class="prompt-metrics" title="${fmtPromptMetricsTitle(p)}">${fmtPromptMetrics(p)}</span>
-      <span class="prompt-text" title="${p.summary.replace(/"/g,'&quot;')}">${p.summary}</span>
+      <span class="prompt-text" title="${p.summary.replace(/"/g,'&quot;')}"
+            onmouseenter="showRawPromptOnHover(this, ${p.id}, ${p.timestamp})">${p.summary}</span>
     </div>`).join('');
 }
 

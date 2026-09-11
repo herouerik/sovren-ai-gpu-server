@@ -307,14 +307,24 @@ correlation by timing: reliable (not a guess) for any service running
 `OLLAMA_NUM_PARALLEL=1`, since exactly one request is ever in flight at a
 time. Shows "pending…" until that arrives.
 
-**Privacy** — this only ever stores the derived summary (bounded by
-`fallback_max_chars`), never the raw prompt or response body. The full
-body exists only transiently, in-process, for the duration of one
-mirrored request. This matters because inference traffic through a
-coding-agent pool can carry
-proprietary source or secrets; don't widen `_extract_prompt_text` in
-`src/main.py` to persist more than that without thinking through what
-you're now storing at rest.
+**Privacy** — `data/monitor.db` only ever stores the derived summary
+(bounded by `fallback_max_chars`), never the raw prompt or response body.
+This matters because inference traffic through a coding-agent pool can
+carry proprietary source or secrets; don't widen `_extract_prompt_text`
+in `src/main.py` to persist more than that in the database without
+thinking through what you're now storing at rest.
+
+One deliberate, narrow exception: hovering a summary in the dashboard
+shows the real prompt text it came from (`GET /api/prompt_raw/{id}`),
+for when a summary is too compressed or too strange to make sense of on
+its own. That text lives only in server memory (`storage.
+cache_raw_prompt`), capped at 4000 chars per entry and the same ring size
+as `prompt_summaries` — it is never written to `data/monitor.db`, never
+backed up, and gone on restart. Still real inference content sitting in
+RAM for a while, so this is a real (if bounded and ephemeral) exception
+to "only the summary is ever kept" — worth knowing if you're deploying
+this somewhere the process's own memory needs to be trusted, not just the
+database file.
 
 ## Data Schema
 
@@ -440,6 +450,7 @@ upserts, one row per GPU/service. See `src/storage.py` for exact columns and the
 | `GET /api/ollama/services` | Ollama service status & loaded models |
 | `GET /api/patterns` | Detected anomalies |
 | `GET /api/prompt_summaries` | Recent one-line prompt summaries (see [Prompt insight](#prompt-insight)) |
+| `GET /api/prompt_raw/{id}` | Real prompt text behind one summary, in-memory only (see [Prompt insight](#prompt-insight)) |
 | `POST /api/prompt_mirror` | Reverse-proxy mirror target — not for direct use, see [Prompt insight](#prompt-insight) |
 | `WS /ws` | Live updates (GPU samples, connections, lifecycle events, patterns) |
 

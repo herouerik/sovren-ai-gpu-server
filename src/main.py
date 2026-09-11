@@ -67,7 +67,8 @@ import httpx
 from src.config import settings
 from src.storage import (
     get_db, execute, query_all, query_one, ring_insert, upgrade_ring_row,
-    attach_prompt_metrics, latest_gpu_samples, query_gpu_samples,
+    attach_prompt_metrics, cache_raw_prompt, get_raw_prompt,
+    latest_gpu_samples, query_gpu_samples,
 )
 from src.collectors import GPUCollector, OllamaStateCollector, LogTailer, ConnectionsCollector, GPUHardwareCollector
 from src.lifecycle import get_tracker
@@ -808,7 +809,10 @@ def _truncate_to_words(text: str, max_words: int, max_chars: int) -> str:
 def _extract_prompt_text(endpoint: str, body: Dict[str, Any]) -> Optional[str]:
     if endpoint.endswith("/api/generate"):
         return body.get("prompt")
-    if endpoint.endswith("/api/chat"):
+    # /api/chat (Ollama native) and /v1/chat/completions (OpenAI-compatible)
+    # use the identical {"messages": [{"role":..., "content":...}]} shape --
+    # same extraction either way.
+    if endpoint.endswith("/api/chat") or endpoint.endswith("/v1/chat/completions"):
         messages = body.get("messages") or []
         for m in reversed(messages):
             if m.get("role") == "user" and m.get("content"):
@@ -907,6 +911,7 @@ async def prompt_mirror(request: Request):
         "summary": _truncate_to_words(prompt_text, cfg.fallback_max_words, cfg.fallback_max_chars),
         "source": "truncated",
     }, capacity=cfg.ring_capacity)
+    cache_raw_prompt(row_id, timestamp, prompt_text)
 
     if cfg.summarizer_service:
         asyncio.create_task(_summarize_via_llm(row_id, timestamp, prompt_text))
@@ -918,6 +923,18 @@ async def prompt_mirror(request: Request):
 async def get_prompt_summaries(limit: int = Query(20, le=200)):
     rows = execute("SELECT * FROM prompt_summaries ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/prompt_raw/{row_id}")
+async def get_prompt_raw(row_id: int, timestamp: float = Query(...)):
+    """The actual mirrored prompt text behind a Recent Prompts row's
+    summary -- in memory only (see storage.cache_raw_prompt), never in
+    data/monitor.db. `timestamp` must match the row exactly, guarding
+    against a ring slot that's since been overwritten by a newer prompt."""
+    text = get_raw_prompt(row_id, timestamp)
+    if text is None:
+        return JSONResponse({"error": "not available (evicted or predates last restart)"}, status_code=404)
+    return {"text": text}
 
 
 @app.websocket("/ws")
