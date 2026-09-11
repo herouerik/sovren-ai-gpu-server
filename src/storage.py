@@ -24,6 +24,7 @@ def get_db() -> sqlite3.Connection:
             _db = sqlite3.connect(str(db_path), check_same_thread=False)
             _db.row_factory = sqlite3.Row
             _init_schema(_db)
+            _migrate_schema(_db)
         return _db
 
 
@@ -185,13 +186,19 @@ def _init_schema(db: sqlite3.Connection):
             throttle_reasons TEXT
         );
 
-        -- Fixed-capacity ring, same scheme as `requests`.
+        -- Fixed-capacity ring, same scheme as `requests`. ttft_ms and
+        -- tokens_per_second come straight from llama.cpp's own per-task
+        -- "prompt eval time" / "eval time" summary lines -- not estimated,
+        -- not derived from the GIN access log (which structurally can't
+        -- carry them; see requests table notes in README).
         CREATE TABLE IF NOT EXISTS task_samples (
             id INTEGER PRIMARY KEY,
             timestamp REAL NOT NULL,
             service_name TEXT NOT NULL,
             task_id INTEGER,
-            total_tokens INTEGER
+            total_tokens INTEGER,
+            ttft_ms REAL,
+            tokens_per_second REAL
         );
 
         CREATE INDEX IF NOT EXISTS idx_task_samples_timestamp ON task_samples(timestamp);
@@ -243,6 +250,18 @@ def _init_schema(db: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_benchmark_pool_model ON benchmark_results(pool_name, model);
         CREATE INDEX IF NOT EXISTS idx_benchmark_day_slot ON benchmark_results(day_slot);
     """)
+
+
+def _migrate_schema(db: sqlite3.Connection):
+    """CREATE TABLE IF NOT EXISTS doesn't add columns to a table that
+    already exists on disk with an older shape -- add missing columns here
+    rather than requiring a fresh database."""
+    cols = {row[1] for row in db.execute("PRAGMA table_info(task_samples)").fetchall()}
+    if "ttft_ms" not in cols:
+        db.execute("ALTER TABLE task_samples ADD COLUMN ttft_ms REAL")
+    if "tokens_per_second" not in cols:
+        db.execute("ALTER TABLE task_samples ADD COLUMN tokens_per_second REAL")
+    db.commit()
 
 
 @contextmanager

@@ -370,9 +370,16 @@ CREATE TABLE task_samples (
     timestamp REAL NOT NULL,
     service_name TEXT NOT NULL,
     task_id INTEGER,
-    total_tokens INTEGER               -- from `slot release: ... n_tokens=`
+    total_tokens INTEGER,               -- from `slot release: ... n_tokens=`
+    ttft_ms REAL,                       -- from `... prompt eval time = N ms ...`
+    tokens_per_second REAL              -- from `... eval time = ... N tokens per second)`
 );
 ```
+`ttft_ms`/`tokens_per_second` are llama.cpp's own per-task timing, not estimated and not
+derived from the GIN access log (which structurally can't carry them — see `requests`
+below). `/api/metrics/summary`'s `by_model` rows include the window average of both,
+joined in by `service_name`.
+
 `/api/task_samples` also reports the single most-repeated token count in the window as
 `likely_heartbeat_signature` — a fixed automated health-check probe sends the same
 prompt every time and gets the same token count back; real work doesn't.

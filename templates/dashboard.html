@@ -222,7 +222,7 @@ canvas{max-width:100%}
     <div class="section">
       <div class="section-head"><span class="section-title">Requests by Model / Service</span></div>
       <div class="section-body"><table class="data" id="modelTable"><thead>
-        <tr><th>Model / Service</th><th>Reqs</th><th>Avg Latency</th><th>Errors</th></tr>
+        <tr><th>Model / Service</th><th>Reqs</th><th>Avg Latency</th><th title="Time to first token -- prefill phase, from llama.cpp's own per-task timing">TTFT</th><th>Avg TPS</th><th>Errors</th></tr>
       </thead><tbody></tbody></table></div>
     </div>
     <div class="section">
@@ -438,8 +438,10 @@ function renderMetricsTables(summary) {
   modelBody.innerHTML = summary.by_model.length ? summary.by_model.map(r => `
     <tr><td>${r.model_or_service}</td><td>${r.request_count}</td>
     <td>${r.avg_latency_ms ? r.avg_latency_ms.toFixed(0)+'ms' : '—'}</td>
+    <td>${r.avg_ttft_ms ? r.avg_ttft_ms.toFixed(0)+'ms' : '—'}</td>
+    <td>${r.avg_tps ? r.avg_tps.toFixed(1) : '—'}</td>
     <td class="${r.error_count ? 'hw-warn' : ''}">${r.error_count}</td></tr>`).join('')
-    : '<tr class="empty-row"><td colspan="4">No requests yet.</td></tr>';
+    : '<tr class="empty-row"><td colspan="6">No requests yet.</td></tr>';
 
   renderCallerTable(summary.by_caller);
 }

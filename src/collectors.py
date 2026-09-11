@@ -176,6 +176,11 @@ class LogTailer:
     def __init__(self):
         self._positions: Dict[str, float] = {}
         self._last_entry: Dict[str, tuple] = {}
+        # task_id -> {"ttft_ms": ..., "tokens_per_second": ...}, populated as
+        # "prompt eval time" / "eval time" lines stream in and consumed
+        # (popped) the moment that task's slot release line arrives. See
+        # _track_task_metrics().
+        self._task_metrics: Dict[int, Dict[str, float]] = {}
 
     async def tail_service(self, systemd_service: str) -> List[LogEntry]:
         """Get new log lines since the last call for this service.
@@ -327,16 +332,48 @@ class LogTailer:
 
     _RE_SLOT_RELEASE = re.compile(r'task\s+(\d+)\s+\|\s+stop processing:\s+n_tokens\s*=\s*(\d+)')
 
+    # llama.cpp's own per-task timing summary, logged shortly before slot
+    # release -- "prompt eval time" is the prefill phase before the first
+    # generated token (TTFT), "eval time" is the generation phase and
+    # already carries the average tokens/sec for that task. Neither is
+    # estimated here, just parsed straight from the server's own numbers.
+    _RE_PROMPT_EVAL_TIME = re.compile(r'task\s+(\d+)\s+\|\s+prompt eval time\s*=\s*([\d.]+)\s*ms')
+    _RE_EVAL_TIME = re.compile(
+        r'task\s+(\d+)\s+\|\s+eval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens\s*'
+        r'\(\s*[\d.]+\s*ms per token,\s*([\d.]+)\s*tokens per second\)'
+    )
+    _MAX_TRACKED_TASKS = 500  # safety net against a leak if slot release is never seen for a task
+
+    def _track_task_metrics(self, entry: LogEntry) -> None:
+        """Opportunistically capture TTFT and avg TPS per task_id as their
+        summary lines stream by, for extract_slot_info() to attach once
+        that task's slot release line arrives (see _RE_SLOT_RELEASE)."""
+        m = self._RE_PROMPT_EVAL_TIME.search(entry.message)
+        if m:
+            task_id, ttft_ms = m.groups()
+            self._task_metrics.setdefault(int(task_id), {})["ttft_ms"] = float(ttft_ms)
+            return
+        m = self._RE_EVAL_TIME.search(entry.message)
+        if m:
+            task_id, tps = m.groups()
+            self._task_metrics.setdefault(int(task_id), {})["tokens_per_second"] = float(tps)
+            if len(self._task_metrics) > self._MAX_TRACKED_TASKS:
+                self._task_metrics.clear()
+
     def extract_slot_info(self, entry: LogEntry) -> Optional[Dict[str, Any]]:
+        self._track_task_metrics(entry)
         m = self._RE_SLOT_RELEASE.search(entry.message)
         if not m:
             return None
         task_id, n_tokens = m.groups()
+        metrics = self._task_metrics.pop(int(task_id), {})
         return {
             "timestamp": entry.timestamp,
             "service_name": entry.service_name,
             "task_id": int(task_id),
             "total_tokens": int(n_tokens),
+            "ttft_ms": metrics.get("ttft_ms"),
+            "tokens_per_second": metrics.get("tokens_per_second"),
         }
 
 
