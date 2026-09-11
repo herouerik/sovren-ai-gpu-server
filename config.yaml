@@ -11,9 +11,9 @@ ollama:
       port: 11435
       gpu_ids: [0]
       model: "qwen2.5-coder:7b"
-      description: "GPU 0 (RTX 2080 Ti) meta pool — provisioned, intentionally dormant. Confirmed disabled with zero journal history as of 2026-09. Not an error state; do not alert on it being unreachable."
+      description: "GPU 0 (RTX 2080 Ti) meta pool — dedicated to prompt_insight.summarizer_service (see README \"Prompt insight\"), started 2026-09-11. Not customer-facing inference; kept isolated from the main pool (OLLAMA_VULKAN=false) specifically so it never competes with it."
       systemd_service: "ollama-meta.service"
-      enabled: false
+      enabled: true
 
 collectors:
   gpu_poll_interval_seconds: 2

@@ -256,6 +256,7 @@ const fmtCountdown = (ts) => {
   if (!ts) return '—';
   const diff = ts - Date.now()/1000;
   if (diff < 0) return 'expired';
+  if (diff > 365 * 86400) return 'no expiry';  // OLLAMA_KEEP_ALIVE=-1 ("forever")
   return fmtDuration(diff) + ' left';
 };
 
