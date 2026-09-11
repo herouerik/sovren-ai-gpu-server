@@ -444,7 +444,7 @@ async def get_timeseries(
     metric: str = Query(..., description="Metric: latency, tps, ttft, requests, gpu_util, gpu_mem, gpu_power, gpu_temp"),
     group_by: str = Query("model", description="Group by: model, service, gpu, caller"),
     window_seconds: int = Query(3600, ge=60, le=86400),
-    bucket_seconds: int = Query(60, ge=10, le=3600)
+    bucket_seconds: int = Query(60, ge=1, le=3600)
 ):
     """Time-series data for charts."""
     cutoff = time.time() - window_seconds

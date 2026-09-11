@@ -73,7 +73,7 @@ a{color:inherit}
 /* SECTIONS */
 .section{background:var(--surf);border:1px solid var(--border);border-radius:4px;overflow:hidden}
 .section-head{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-.section-title{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.section-title{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);cursor:help;border-bottom:1px dotted var(--muted)}
 .section-body{padding:14px 16px}
 
 /* TIMELINE */
@@ -103,12 +103,13 @@ a{color:inherit}
 .hw-warn{color:var(--yellow)}
 .hw-crit{color:var(--red);font-weight:600}
 
-/* GPU LOAD STRIP */
-.load-strip{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
-.load-bar-wrap{display:flex;flex-direction:column;align-items:center;gap:4px}
-.load-bar-track{width:100%;height:70px;background:var(--surf2);border-radius:2px;display:flex;align-items:flex-end;overflow:hidden}
-.load-bar-fill{width:100%;background:var(--accent);transition:height .3s}
-.load-bar-label{font-size:8px;color:var(--dim)}
+/* GPU LOAD STRIP -- nvtop-style scrolling line charts, one fixed-size
+   chart per GPU (flex-wrap, not a grid stretched to the GPU count) so a
+   box with 1 GPU and a box with 7 both show the same ~90s time window at
+   the same density, rather than one GPU getting a huge stretched chart. */
+.load-strip{display:flex;flex-wrap:wrap;gap:10px}
+.load-chart-wrap{display:flex;flex-direction:column;align-items:center;gap:4px;width:160px;background:var(--surf2);border-radius:2px;padding:6px}
+.load-chart-label{font-size:8px;color:var(--dim);font-variant-numeric:tabular-nums}
 
 /* TABLES */
 table.data{width:100%;border-collapse:collapse;font-size:10px}
@@ -176,7 +177,7 @@ canvas{max-width:100%}
 
   <!-- RELOAD-CYCLE TIMELINE -->
   <div class="section">
-    <div class="section-head"><span class="section-title">Load Cycle Timeline</span>
+    <div class="section-head"><span class="section-title" title="Every model load attempt per service, in order -- not requests, loads. A reload storm, a load-cancel timeout cascade, or a near-zero keep_alive self-eviction all show up here as short-lived segments; hover a segment for exact timing, context size, and trigger IP.">Load Cycle Timeline</span>
       <span style="font-size:9px;color:var(--muted)">last 50 cycles per service</span></div>
     <div class="section-body">
       <div class="timeline" id="timeline"></div>
@@ -192,7 +193,7 @@ canvas{max-width:100%}
   <div class="two-col">
     <!-- GPU HARDWARE -->
     <div class="section">
-      <div class="section-head"><span class="section-title">GPU Hardware Health</span></div>
+      <div class="section-head"><span class="section-title" title="Real hardware faults -- ECC memory errors and pending page retirement, from nvidia-smi -- not load or performance. A checklist of 'is this card dying,' distinct from the compute/VRAM chart below. Changes rarely; polled every 60s.">GPU Hardware Health</span></div>
       <div class="section-body">
         <table class="hw-table" id="hwTable">
           <thead><tr><th>GPU</th><th>ECC Corrected</th><th>ECC Uncorrected</th><th>Retired Pages</th><th>Status</th></tr></thead>
@@ -203,7 +204,7 @@ canvas{max-width:100%}
 
     <!-- REAL VS HEARTBEAT -->
     <div class="section">
-      <div class="section-head"><span class="section-title">Real Work vs. Heartbeat Traffic</span>
+      <div class="section-head"><span class="section-title" title="Tells genuinely varied inference work apart from a fixed automated health-check probe, using real per-task token counts from llama.cpp's own logs. The single most-repeated exact token count in the window is assumed to be the heartbeat signature; everything else counts as real work.">Real Work vs. Heartbeat Traffic</span>
         <span style="font-size:9px;color:var(--muted)">last hour</span></div>
       <div class="section-body" id="taskSummary"></div>
     </div>
@@ -211,7 +212,7 @@ canvas{max-width:100%}
 
   <!-- GPU LOAD STRIP -->
   <div class="section">
-    <div class="section-head"><span class="section-title">GPU Compute (live)</span></div>
+    <div class="section-head"><span class="section-title" title="Per-GPU utilization, scrolling over roughly the last 90 seconds at 3s resolution -- in-memory only, never persisted to disk. One fixed-size chart per GPU regardless of how many GPUs this box has.">GPU Compute (live)</span></div>
     <div class="section-body">
       <div class="load-strip" id="loadStrip"></div>
     </div>
@@ -220,26 +221,26 @@ canvas{max-width:100%}
   <div class="two-col">
     <!-- CONNECTIONS CHART -->
     <div class="section">
-      <div class="section-head"><span class="section-title">Established Connections</span></div>
+      <div class="section-head"><span class="section-title" title="Established TCP connection count per service over time -- the one signal that catches a caller retrying faster than the queue drains before any request has even completed or failed.">Established Connections</span></div>
       <div class="section-body"><canvas id="connChart" height="140"></canvas></div>
     </div>
 
     <!-- PATTERNS -->
     <div class="section">
-      <div class="section-head"><span class="section-title">Patterns &amp; Alerts</span></div>
+      <div class="section-head"><span class="section-title" title="Automatically detected anomalies: reload storms, load-cancel timeout cascades, context-size churn, connection pileups, latency spikes, delete attempts, quota/rate-limit signals, GPU starvation, hardware faults, CPU spillover. Retained 14 days.">Patterns &amp; Alerts</span></div>
       <div class="section-body"><div class="pattern-list" id="patternList"></div></div>
     </div>
   </div>
 
   <div class="two-col">
     <div class="section">
-      <div class="section-head"><span class="section-title">Requests by Model / Service</span></div>
+      <div class="section-head"><span class="section-title" title="Aggregated over the current window: request counts, error rate, average end-to-end latency (queue + prefill + generation), and real per-task TTFT/prefill/decode throughput from llama.cpp's own timing.">Requests by Model / Service</span></div>
       <div class="section-body"><table class="data" id="modelTable"><thead>
         <tr><th>Model / Service</th><th>Reqs</th><th>Avg Latency</th><th title="Time to first token -- prefill phase, from llama.cpp's own per-task timing">TTFT</th><th title="Prompt processing throughput (the prefill phase) -- highly parallel, normally much higher than decode">Prefill TPS</th><th title="Token generation throughput (the decode phase) -- what's usually meant by tok/s">Decode TPS</th><th>Errors</th></tr>
       </thead><tbody></tbody></table></div>
     </div>
     <div class="section">
-      <div class="section-head"><span class="section-title">Requests by Caller IP</span></div>
+      <div class="section-head"><span class="section-title" title="One row per caller IP, one column per service (not one row per IP+service pair) -- reqs and avg latency for each, so you can see which pool a given caller is actually using.">Requests by Caller IP</span></div>
       <div class="section-body"><table class="data" id="callerTable"><thead>
         <tr><th>Caller IP</th><th>Reqs</th><th>Avg Latency</th><th>Errors</th></tr>
       </thead><tbody></tbody></table></div>
@@ -247,7 +248,7 @@ canvas{max-width:100%}
   </div>
 
   <div class="section">
-    <div class="section-head"><span class="section-title">Recent Prompts</span></div>
+    <div class="section-head"><span class="section-title" title="Opt-in (see README 'Prompt insight'): one-line summaries of recent real prompts, mirrored from a reverse proxy -- mechanical truncation by default, or a real summary from a small local model if configured. Hover a row's summary to see the actual prompt text.">Recent Prompts</span></div>
     <div class="section-body">
       <div class="prompt-legend">
         <span><span class="legend-dot" style="background:var(--blue)"></span>LLM summary</span>
@@ -387,25 +388,57 @@ function renderHardware(rows) {
   }
 }
 
-let loadStripChart = {};
-function renderLoadStrip(samples) {
+// GPU Compute (live): nvtop-style scrolling line charts, one fixed-size
+// chart per GPU. Fixed chart width + fixed time window regardless of GPU
+// count -- a box with 1 GPU shows the same ~90s/3s-bucket window as a box
+// with 7, never a single chart stretched across the whole row.
+const LOAD_STRIP_WINDOW_SECONDS = 120;
+const LOAD_STRIP_BUCKET_SECONDS = 3;
+let loadCharts = {};
+function renderLoadStrip(seriesResp) {
   const el = $('loadStrip');
-  const latest = {};
-  for (const s of samples) latest[s.gpu_index] = s;
-  const indices = Object.keys(latest).map(Number).sort((a,b)=>a-b);
+  const rows = seriesResp.series || [];  // [{timestamp, "<gpu_index>": util, ...}, ...]
+  const indexSet = new Set();
+  for (const row of rows) for (const k of Object.keys(row)) if (k !== 'timestamp') indexSet.add(k);
+  const indices = [...indexSet].map(Number).sort((a, b) => a - b);
+
   if (!el.children.length) {
     el.innerHTML = indices.map(i => `
-      <div class="load-bar-wrap">
-        <div class="load-bar-track"><div class="load-bar-fill" id="bar-${i}" style="height:0%"></div></div>
-        <div class="load-bar-label" id="lbl-${i}">GPU ${i}</div>
+      <div class="load-chart-wrap">
+        <div class="load-chart-label" id="load-lbl-${i}">GPU ${i}</div>
+        <canvas id="load-chart-${i}" width="148" height="46"></canvas>
       </div>`).join('');
   }
+
   for (const i of indices) {
-    const s = latest[i];
-    const bar = $('bar-' + i);
-    if (bar) bar.style.height = (s.gpu_utilization_percent || 0) + '%';
-    const lbl = $('lbl-' + i);
-    if (lbl) lbl.textContent = `GPU ${i} · ${(s.gpu_utilization_percent||0).toFixed(0)}%`;
+    const key = String(i);
+    const points = rows.map(r => ({ x: r.timestamp, y: r[key] ?? null }));
+    const latest = points.length ? points[points.length - 1].y : null;
+    const lbl = $('load-lbl-' + i);
+    if (lbl) lbl.textContent = `GPU ${i} · ${latest != null ? latest.toFixed(0) + '%' : '—'}`;
+
+    if (!loadCharts[i]) {
+      const canvas = $('load-chart-' + i);
+      if (!canvas) continue;
+      loadCharts[i] = new Chart(canvas, {
+        type: 'line',
+        data: { datasets: [{
+          data: points, borderColor: '#c8681e', backgroundColor: 'rgba(200,104,30,.15)',
+          fill: true, tension: 0.15, pointRadius: 0, borderWidth: 1.2,
+        }] },
+        options: {
+          responsive: false, animation: false, parsing: false,
+          scales: {
+            x: { type: 'linear', display: false },
+            y: { type: 'linear', min: 0, max: 100, display: false },
+          },
+          plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        },
+      });
+    } else {
+      loadCharts[i].data.datasets[0].data = points;
+      loadCharts[i].update('none');
+    }
   }
 }
 
@@ -597,11 +630,11 @@ function renderConnChart(samples) {
 
 async function refreshAll() {
   try {
-    const [status, cycles, hw, gpus, tasks, conns, patterns, summary, prompts] = await Promise.all([
+    const [status, cycles, hw, loadSeries, tasks, conns, patterns, summary, prompts] = await Promise.all([
       getJSON('/api/health_status'),
       getJSON('/api/load_cycles?limit=200'),
       getJSON('/api/gpu_hardware'),
-      getJSON('/api/gpus'),
+      getJSON(`/api/metrics/timeseries?metric=gpu_util&group_by=gpu&window_seconds=${LOAD_STRIP_WINDOW_SECONDS}&bucket_seconds=${LOAD_STRIP_BUCKET_SECONDS}`),
       getJSON('/api/task_samples?window_seconds=3600'),
       getJSON('/api/connections?window_seconds=1800'),
       getJSON('/api/patterns?limit=30'),
@@ -612,7 +645,7 @@ async function refreshAll() {
     renderGauges(status);
     renderTimeline(cycles);
     renderHardware(hw);
-    renderLoadStrip(gpus);
+    renderLoadStrip(loadSeries);
     renderTaskSummary(tasks);
     renderConnChart(conns);
     renderPatterns(patterns);
