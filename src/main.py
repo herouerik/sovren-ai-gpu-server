@@ -67,7 +67,7 @@ import httpx
 from src.config import settings
 from src.storage import (
     get_db, execute, query_all, query_one, ring_insert, upgrade_ring_row,
-    latest_gpu_samples, query_gpu_samples,
+    attach_prompt_metrics, latest_gpu_samples, query_gpu_samples,
 )
 from src.collectors import GPUCollector, OllamaStateCollector, LogTailer, ConnectionsCollector, GPUHardwareCollector
 from src.lifecycle import get_tracker
@@ -211,6 +211,21 @@ async def log_capture_orchestrator():
                             "prefill_tps": slot_info["prefill_tps"],
                             "decode_tps": slot_info["decode_tps"],
                         }, capacity=settings.storage.raw_ring_capacity)
+                        # Best-effort: attach these same numbers to the
+                        # Recent Prompts row this task most likely came
+                        # from -- see storage.attach_prompt_metrics(). Skip
+                        # entirely if ttft_ms is missing (e.g. an errored/
+                        # cancelled task with no timing lines) -- writing
+                        # nulls would leave the row matchable as "still
+                        # pending" and risk a later task attaching to it
+                        # instead of its own.
+                        if slot_info["ttft_ms"] is not None:
+                            attach_prompt_metrics(slot_info["service_name"], slot_info["timestamp"], {
+                                "total_tokens": slot_info["total_tokens"],
+                                "ttft_ms": slot_info["ttft_ms"],
+                                "prefill_tps": slot_info["prefill_tps"],
+                                "decode_tps": slot_info["decode_tps"],
+                            })
                         await broadcast_ws({"type": "slot_release", "data": slot_info})
         except Exception as e:
             print(f"Log capture error: {e}")
@@ -822,17 +837,17 @@ async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
     if not summarizer:
         return
     instruction = (
-        "Summarize the following prompt in at most 8 words, imperative style, "
-        "no trailing punctuation, no quotes, no code, no markdown, no diffs -- "
-        "plain text only, describing what is being asked for, never repeating "
-        "any of the prompt's own text verbatim:\n\n" + prompt_text[:4000]
+        f"Summarize the following prompt in one or two plain sentences, at most "
+        f"{cfg.fallback_max_chars} characters, describing what is being asked for. "
+        "No code, no markdown, no diffs, no quotes -- plain text only, and never "
+        "repeat any of the prompt's own text verbatim:\n\n" + prompt_text[:4000]
     )
     try:
         async with httpx.AsyncClient(timeout=cfg.summarizer_timeout_seconds) as client:
             resp = await client.post(
                 f"http://127.0.0.1:{summarizer.port}/api/generate",
                 json={"model": summarizer.model, "prompt": instruction, "stream": False,
-                      "options": {"num_predict": 24}},
+                      "options": {"num_predict": 80}},
             )
         resp.raise_for_status()
         raw = resp.json().get("response", "")

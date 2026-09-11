@@ -125,16 +125,19 @@ table.data tr:hover td{background:var(--surf2)}
 .pattern-desc{font-size:10px;color:var(--text)}
 .pattern-time{font-size:8px;color:var(--muted);margin-top:2px}
 
-/* RECENT PROMPTS -- one line each, never wraps, always ellipsized. Source
-   (LLM summary vs. mechanical truncation) is a left border color, not
-   per-row text -- see .prompt-legend below -- to keep the row's horizontal
-   space for what actually varies in length: the model name. */
-.prompt-list{display:flex;flex-direction:column;gap:1px;max-height:320px;overflow-y:auto}
+/* RECENT PROMPTS -- one line each, never wraps. Source (LLM summary vs.
+   mechanical truncation) is a left border color, not per-row text -- see
+   .prompt-legend below. Summaries can run up to ~200 chars now (see
+   config prompt_insight.fallback_max_chars); rather than ellipsizing that
+   away, the text itself scrolls sideways within its own bounded box --
+   the row's other columns (time/svc/metrics) stay put either way. */
+.prompt-list{display:flex;flex-direction:column;gap:1px;max-height:480px;overflow-y:auto}
 .prompt-item{padding:6px 10px;display:flex;gap:10px;align-items:center;background:var(--surf2);border-left:2px solid var(--blue)}
 .prompt-item.truncated{border-left-color:var(--muted)}
 .prompt-time{font-size:8px;color:var(--muted);flex-shrink:0;width:56px;font-variant-numeric:tabular-nums}
 .prompt-svc{font-size:8px;color:var(--dim);flex-shrink:0;width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.prompt-text{font-size:10px;color:var(--text);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prompt-metrics{font-size:8px;color:var(--muted);flex-shrink:0;width:150px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prompt-text{font-size:10px;color:var(--text);flex:1;min-width:0;max-width:520px;overflow-x:auto;overflow-y:hidden;white-space:nowrap;scrollbar-width:thin}
 .prompt-item.truncated .prompt-text{color:var(--dim)}
 .prompt-legend{display:flex;gap:14px;margin-bottom:8px;font-size:9px;color:var(--dim)}
 
@@ -422,6 +425,24 @@ function renderPatterns(patterns) {
     </div>`).join('');
 }
 
+function fmtPromptMetrics(p) {
+  // Metrics arrive asynchronously, well after the row itself is created
+  // (see storage.attach_prompt_metrics -- best-effort correlation by
+  // timing, since there's no shared id) -- still null just means the
+  // underlying request hasn't completed yet, not an error.
+  if (p.ttft_ms == null) return 'pending…';
+  const tok = p.total_tokens != null ? p.total_tokens + 'tok' : '?tok';
+  const ttft = p.ttft_ms.toFixed(0) + 'ms';
+  const decode = p.decode_tps != null ? p.decode_tps.toFixed(0) + 'tps' : '?tps';
+  return `${tok} · ${ttft} · ${decode}`;
+}
+
+function fmtPromptMetricsTitle(p) {
+  if (p.ttft_ms == null) return 'Metrics not attached yet';
+  const prefill = p.prefill_tps != null ? p.prefill_tps.toFixed(1) : '—';
+  return `${p.total_tokens ?? '—'} tokens · TTFT ${p.ttft_ms.toFixed(0)}ms · prefill ${prefill} tok/s · decode ${p.decode_tps?.toFixed(1) ?? '—'} tok/s`;
+}
+
 function renderPrompts(prompts) {
   const el = $('promptList');
   if (!prompts.length) { el.innerHTML = '<div style="color:var(--dim);font-size:10px;padding:8px">No prompts captured yet — requires a reverse-proxy mirror, see README.</div>'; return; }
@@ -429,6 +450,7 @@ function renderPrompts(prompts) {
     <div class="prompt-item ${p.source}">
       <span class="prompt-time">${fmtTime(p.timestamp)}</span>
       <span class="prompt-svc">${p.service_name}${p.model ? ' · ' + p.model : ''}</span>
+      <span class="prompt-metrics" title="${fmtPromptMetricsTitle(p)}">${fmtPromptMetrics(p)}</span>
       <span class="prompt-text" title="${p.summary.replace(/"/g,'&quot;')}">${p.summary}</span>
     </div>`).join('');
 }
@@ -551,7 +573,7 @@ async function refreshAll() {
       getJSON('/api/connections?window_seconds=1800'),
       getJSON('/api/patterns?limit=30'),
       getJSON('/api/metrics/summary?window_seconds=3600'),
-      getJSON('/api/prompt_summaries?limit=20'),
+      getJSON('/api/prompt_summaries?limit=100'),
     ]);
     renderHero(status);
     renderGauges(status);

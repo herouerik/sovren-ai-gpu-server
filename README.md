@@ -22,8 +22,10 @@ whether the box is actually healthy right now — not just a metrics dump.
   churn, near-zero keep_alive evictions, connection pileups, latency spikes, delete
   attempts, quota/rate-limit signals, GPU starvation, GPU hardware faults, CPU spillover
 - **Prompt insight** *(opt-in, see [Prompt insight](#prompt-insight))*: one-line,
-  ~8-word summaries of the most recent prompts — mechanical by default, or a real
-  summary from a small local model if you point one at it
+  scrollable summaries (up to `fallback_max_chars`, default 200) of the most recent
+  prompts — mechanical by default, or a real summary from a small local model if you
+  point one at it — plus real per-request TTFT/prefill/decode metrics, attached
+  asynchronously once each request actually completes
 - **Dashboard**: single-page, health-first layout — a hero status card, a color-coded
   load-cycle timeline, a GPU hardware checklist, live compute strip, and alerts
 
@@ -188,8 +190,8 @@ prompt_insight:      # see "Prompt insight" below -- off by default
   enabled: false
   summarizer_service: "meta"
   summarizer_timeout_seconds: 20
-  fallback_max_words: 8
-  fallback_max_chars: 100
+  fallback_max_words: 40
+  fallback_max_chars: 200
   ring_capacity: 100
 ```
 
@@ -284,8 +286,10 @@ app — YAML config is only read at startup).
 (first `fallback_max_words` words / `fallback_max_chars` chars, whichever
 is shorter, stored immediately, synchronously). If
 `prompt_insight.summarizer_service` names a reachable entry in
-`ollama.services`, a background task then asks it for a real ~8-word
-summary and upgrades the stored row in place — this never blocks the
+`ollama.services`, a background task then asks it for a real one-or-two-
+sentence summary (same `fallback_max_chars` cap applied to whatever it
+returns, so a model that ignores the length instruction still can't blow
+past it) and upgrades the stored row in place — this never blocks the
 mirror response, and a summarizer that's unset, unreachable, or slow just
 means every prompt stays on the mechanical fallback, silently, no error.
 Point it at hardware that isn't part of your real inference pool if you
@@ -295,10 +299,19 @@ inference for capacity, and can time out under load (observed directly
 while building this: a real generate call to the busy production pool on
 this box timed out at 20s with zero bytes back).
 
-**Privacy** — this only ever stores the derived summary (max ~8 words),
-never the raw prompt or response body. The full body exists only
-transiently, in-process, for the duration of one mirrored request. This
-matters because inference traffic through a coding-agent pool can carry
+Each row also gets real per-request TTFT/prefill_tps/decode_tps, attached
+asynchronously once the underlying request actually completes (see
+`storage.attach_prompt_metrics()`) — there's no shared id between a
+mirrored prompt and its eventual completion, so this is a best-effort
+correlation by timing: reliable (not a guess) for any service running
+`OLLAMA_NUM_PARALLEL=1`, since exactly one request is ever in flight at a
+time. Shows "pending…" until that arrives.
+
+**Privacy** — this only ever stores the derived summary (bounded by
+`fallback_max_chars`), never the raw prompt or response body. The full
+body exists only transiently, in-process, for the duration of one
+mirrored request. This matters because inference traffic through a
+coding-agent pool can carry
 proprietary source or secrets; don't widen `_extract_prompt_text` in
 `src/main.py` to persist more than that without thinking through what
 you're now storing at rest.

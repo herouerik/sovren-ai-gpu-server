@@ -91,8 +91,8 @@ class PromptInsightConfig(BaseSettings):
     # to mechanical truncation, no error.
     summarizer_service: Optional[str] = None
     summarizer_timeout_seconds: float = 20.0
-    fallback_max_words: int = 8
-    fallback_max_chars: int = 100
+    fallback_max_words: int = 40
+    fallback_max_chars: int = 200
     ring_capacity: int = 100
 
     model_config = SettingsConfigDict(extra="allow")

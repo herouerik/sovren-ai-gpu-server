@@ -209,11 +209,17 @@ def _init_schema(db: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_task_samples_timestamp ON task_samples(timestamp);
 
         -- Fixed-capacity ring, same scheme as `requests`. Deliberately never
-        -- stores the raw prompt/response body -- only a short (<= ~8-word)
-        -- derived summary, mechanical or LLM-generated (see
-        -- main.py:prompt_mirror). This is inference traffic that can carry
-        -- proprietary source or secrets; the full body only ever exists
-        -- transiently in-process for the duration of one request.
+        -- stores the raw prompt/response body -- only a short derived
+        -- summary, mechanical or LLM-generated (see main.py:prompt_mirror).
+        -- This is inference traffic that can carry proprietary source or
+        -- secrets; the full body only ever exists transiently in-process
+        -- for the duration of one request.
+        --
+        -- total_tokens/ttft_ms/prefill_tps/decode_tps are attached later,
+        -- asynchronously, once the underlying request actually completes
+        -- (there's no shared id between a mirrored prompt and its eventual
+        -- task_samples row -- see storage.attach_prompt_metrics() for how
+        -- they're best-effort correlated by timing). NULL until then.
         CREATE TABLE IF NOT EXISTS prompt_summaries (
             id INTEGER PRIMARY KEY,
             timestamp REAL NOT NULL,
@@ -221,7 +227,11 @@ def _init_schema(db: sqlite3.Connection):
             model TEXT,
             endpoint TEXT NOT NULL,
             summary TEXT NOT NULL,
-            source TEXT NOT NULL  -- 'llm' | 'truncated'
+            source TEXT NOT NULL,  -- 'llm' | 'truncated'
+            total_tokens INTEGER,
+            ttft_ms REAL,
+            prefill_tps REAL,
+            decode_tps REAL
         );
 
         CREATE INDEX IF NOT EXISTS idx_prompt_summaries_timestamp ON prompt_summaries(timestamp);
@@ -275,6 +285,12 @@ def _migrate_schema(db: sqlite3.Connection):
         db.execute("ALTER TABLE task_samples ADD COLUMN decode_tps REAL")
     if "prefill_tps" not in cols:
         db.execute("ALTER TABLE task_samples ADD COLUMN prefill_tps REAL")
+
+    prompt_cols = {row[1] for row in db.execute("PRAGMA table_info(prompt_summaries)").fetchall()}
+    for col in ("total_tokens", "ttft_ms", "prefill_tps", "decode_tps"):
+        if col not in prompt_cols:
+            coltype = "INTEGER" if col == "total_tokens" else "REAL"
+            db.execute(f"ALTER TABLE prompt_summaries ADD COLUMN {col} {coltype}")
     db.commit()
 
 
@@ -349,6 +365,35 @@ def upgrade_ring_row(table: str, row_id: int, timestamp: float, data: Dict[str, 
     db.execute(
         f"UPDATE {table} SET {set_cols} WHERE id = ? AND timestamp = ?",
         (*data.values(), row_id, timestamp),
+    )
+    db.commit()
+
+
+def attach_prompt_metrics(service_name: str, completed_at: float, metrics: Dict[str, Any]) -> None:
+    """Best-effort correlation: attach real per-task metrics (from a
+    task_samples row that just completed) to the most recent still-pending
+    prompt_summaries row for this same service.
+
+    There's no shared id between a mirrored prompt and its eventual
+    task_samples completion -- the mirror only sees the request as it
+    arrives, before Ollama assigns an internal task_id. "Most recent
+    pending row for this service" is unambiguous (not a guess) when that
+    service runs OLLAMA_NUM_PARALLEL=1, since exactly one request is ever
+    in flight at a time -- true for every service on this box today. Under
+    real concurrency this would occasionally misattribute; a no-op if no
+    pending row exists."""
+    db = get_db()
+    row = db.execute("""
+        SELECT id, timestamp FROM prompt_summaries
+        WHERE service_name = ? AND ttft_ms IS NULL AND timestamp <= ?
+        ORDER BY timestamp DESC LIMIT 1
+    """, (service_name, completed_at)).fetchone()
+    if row is None:
+        return
+    set_cols = ", ".join(f"{k} = ?" for k in metrics.keys())
+    db.execute(
+        f"UPDATE prompt_summaries SET {set_cols} WHERE id = ? AND timestamp = ?",
+        (*metrics.values(), row["id"], row["timestamp"]),
     )
     db.commit()
 

@@ -67,13 +67,13 @@ server:
 # (nothing ever arrives, so nothing is stored).
 prompt_insight:
   enabled: true
-  # Name of an entry in ollama.services to ask for a real ~8-word summary
-  # instead of mechanical truncation -- "meta" here is this box's otherwise-
-  # idle GPU 0, dedicated to this so it never competes with real inference.
+  # Name of an entry in ollama.services to ask for a real summary instead
+  # of mechanical truncation -- "meta" here is this box's otherwise-idle
+  # GPU 0, dedicated to this so it never competes with real inference.
   # Not running or not configured: every prompt just falls back to
   # mechanical truncation, silently, no error.
   summarizer_service: "meta"
   summarizer_timeout_seconds: 20
-  fallback_max_words: 8
-  fallback_max_chars: 100
+  fallback_max_words: 40
+  fallback_max_chars: 200
   ring_capacity: 100
