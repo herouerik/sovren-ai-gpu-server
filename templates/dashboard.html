@@ -151,6 +151,18 @@ table.data tr:hover td{background:var(--surf2)}
 .prompt-text{font-size:10px;color:var(--text);flex:0 0 auto;white-space:nowrap}
 .prompt-item.truncated .prompt-text{color:var(--dim)}
 .prompt-legend{display:flex;gap:14px;margin-bottom:8px;font-size:9px;color:var(--dim)}
+.prompt-text{cursor:pointer}
+
+/* Click-to-pin popup showing a Recent Prompts row's real, full text
+   (with real line breaks) -- stays open until closed, unlike a native
+   hover tooltip. Works identically for mechanical-truncation rows and
+   LLM-summary rows -- the raw text is cached server-side for every
+   mirrored prompt regardless of source. */
+.prompt-popup{position:fixed;z-index:100;width:min(600px,90vw);max-height:min(420px,70vh);overflow:auto;background:var(--surf2);border:1px solid var(--border);border-radius:4px;padding:10px;box-shadow:0 8px 28px rgba(0,0,0,.55)}
+.prompt-popup-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px;font-size:9px;color:var(--dim);font-variant-numeric:tabular-nums}
+.prompt-popup-close{cursor:pointer;color:var(--muted);padding:0 4px;font-size:11px}
+.prompt-popup-close:hover{color:var(--text)}
+.prompt-popup-body{font-size:10px;color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5}
 
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 @media (max-width:900px){.two-col{grid-template-columns:1fr}}
@@ -248,7 +260,7 @@ canvas{max-width:100%}
   </div>
 
   <div class="section">
-    <div class="section-head"><span class="section-title" title="Opt-in (see README 'Prompt insight'): one-line summaries of recent real prompts, mirrored from a reverse proxy -- mechanical truncation by default, or a real summary from a small local model if configured. Hover a row's summary to see the actual prompt text.">Recent Prompts</span></div>
+    <div class="section-head"><span class="section-title" title="Opt-in (see README 'Prompt insight'): one-line summaries of recent real prompts, mirrored from a reverse proxy -- mechanical truncation by default, or a real summary from a small local model if configured. Click a row's summary to see the actual prompt text.">Recent Prompts</span></div>
     <div class="section-body">
       <div class="prompt-legend">
         <span><span class="legend-dot" style="background:var(--blue)"></span>LLM summary</span>
@@ -256,6 +268,14 @@ canvas{max-width:100%}
       </div>
       <div class="prompt-list" id="promptList"></div>
     </div>
+  </div>
+
+  <div class="prompt-popup" id="promptPopup" hidden>
+    <div class="prompt-popup-head">
+      <span id="promptPopupMeta"></span>
+      <span class="prompt-popup-close" onclick="closePromptPopup()" title="Close">✕</span>
+    </div>
+    <div class="prompt-popup-body" id="promptPopupBody"></div>
   </div>
 
 </div>
@@ -486,27 +506,55 @@ function fmtPromptMetricsTitle(p) {
   return `${p.total_tokens ?? '—'} tokens · TTFT ${p.ttft_ms.toFixed(0)}ms · prefill ${prefill} tok/s · decode ${p.decode_tps?.toFixed(1) ?? '—'} tok/s`;
 }
 
-async function showRawPromptOnHover(el, id, ts) {
-  // Fetched lazily, once per element -- the raw text lives only in the
-  // server's memory (never data/monitor.db, see storage.cache_raw_prompt),
-  // so this is the one place it's ever requested, and only when someone
-  // actually wants to see what a mysterious summary came from. A real
-  // newline in a `title` attribute renders as a line break in the native
-  // hover tooltip, no custom widget needed.
-  if (el.dataset.rawFetched) return;
-  el.dataset.rawFetched = '1';
-  try {
-    const r = await fetch(`/api/prompt_raw/${id}?timestamp=${ts}`);
-    if (r.ok) {
-      const data = await r.json();
-      el.title = data.text;
-    }
-    // 404 (evicted by ring wraparound, or predates the last restart) --
-    // leave the summary-text title already in place.
-  } catch (e) {
-    el.dataset.rawFetched = '';  // network hiccup -- allow retry on next hover
+// Click-to-pin popup for a Recent Prompts row's real text -- stays open
+// until closed (click the row again, click the X, or click elsewhere),
+// unlike a hover tooltip that vanishes the moment the mouse moves. Works
+// identically for mechanical-truncation and LLM-summary rows -- the raw
+// text is cached server-side for every mirrored prompt regardless of
+// source (see storage.cache_raw_prompt), never written to data/monitor.db.
+let promptPopupOpenFor = null;  // row id currently pinned open, or null
+
+async function togglePromptPopup(el, id, ts, svc, model) {
+  const popup = $('promptPopup');
+  if (promptPopupOpenFor === id && !popup.hidden) {
+    closePromptPopup();
+    return;
   }
+
+  let text = el.dataset.rawText;
+  if (text === undefined) {
+    try {
+      const r = await fetch(`/api/prompt_raw/${id}?timestamp=${ts}`);
+      text = r.ok ? (await r.json()).text : '(raw text no longer available -- evicted, or predates the last restart)';
+    } catch (e) {
+      text = '(failed to fetch raw text)';
+    }
+    el.dataset.rawText = text;  // cache on the element, avoid re-fetching on repeat clicks
+  }
+
+  $('promptPopupMeta').textContent = `${svc}${model ? ' · ' + model : ''} · ${fmtTime(ts)}`;
+  $('promptPopupBody').textContent = text;
+  popup.hidden = false;
+  promptPopupOpenFor = id;
+
+  const rect = el.getBoundingClientRect();
+  const popupWidth = Math.min(600, window.innerWidth * 0.9);
+  popup.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - popupWidth - 8)) + 'px';
+  popup.style.top = (rect.bottom + 6) + 'px';
 }
+
+function closePromptPopup() {
+  $('promptPopup').hidden = true;
+  promptPopupOpenFor = null;
+}
+
+document.addEventListener('click', (e) => {
+  const popup = $('promptPopup');
+  if (popup.hidden) return;
+  if (popup.contains(e.target)) return;             // click inside the popup itself
+  if (e.target.classList?.contains('prompt-text')) return;  // handled by its own click (toggle)
+  closePromptPopup();
+});
 
 function renderPrompts(prompts) {
   const el = $('promptList');
@@ -517,7 +565,7 @@ function renderPrompts(prompts) {
       <span class="prompt-svc">${p.service_name}${p.model ? ' · ' + p.model : ''}</span>
       <span class="prompt-metrics" title="${fmtPromptMetricsTitle(p)}">${fmtPromptMetrics(p)}</span>
       <span class="prompt-text" title="${p.summary.replace(/"/g,'&quot;')}"
-            onmouseenter="showRawPromptOnHover(this, ${p.id}, ${p.timestamp})">${p.summary}</span>
+            onclick="togglePromptPopup(this, ${p.id}, ${p.timestamp}, '${p.service_name}', ${p.model ? `'${p.model.replace(/'/g,"\\'")}'`  : 'null'})">${p.summary}</span>
     </div>`).join('');
 }
 
