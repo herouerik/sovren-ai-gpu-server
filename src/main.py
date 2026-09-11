@@ -599,6 +599,19 @@ async def get_health_status():
             WHERE service_name = ? AND start_ts > ? AND ctx_requested IS NOT NULL
         """, (svc.name, cutoff_15m))["c"]
 
+        # Same idea as ctx churn, but tracking model identity instead of
+        # context size -- two different models sharing the same context
+        # size would otherwise never trip the check above. Reuses the same
+        # window/threshold: a single row can never contribute 2 distinct
+        # values on its own, so a deliberate model switch every few hours
+        # (e.g. a slow bandit comparing sovereign candidates) never fires
+        # this -- it takes >=2 separate reload events inside the SAME
+        # window, which only genuine rapid flapping produces.
+        distinct_model_15m = query_one("""
+            SELECT COUNT(DISTINCT model) as c FROM load_cycles
+            WHERE service_name = ? AND start_ts > ? AND model IS NOT NULL
+        """, (svc.name, cutoff_15m))["c"]
+
         conn = query_one("""
             SELECT established_count FROM connection_samples
             WHERE service_name = ? ORDER BY timestamp DESC LIMIT 1
@@ -610,7 +623,16 @@ async def get_health_status():
             status = "DEGRADED"
             status_reason = f"{conn['established_count']} connections piled up"
         elif latest_cycle and latest_cycle["outcome"] == "pending" and \
-                (time.time() - latest_cycle["start_ts"]) > 30:
+                30 < (time.time() - latest_cycle["start_ts"]) <= 300:
+            # Upper bound matters: found live that a "pending" row can get
+            # stuck forever if the matching "model loaded" journald line is
+            # missed (e.g. during one of this monitor's own restarts) --
+            # without a ceiling, a stale row shows RELOADING permanently
+            # even though /api/ps (resident_model, checked below) proves
+            # the model has been sitting there loaded and fine the whole
+            # time. 300s is comfortably above the longest real reload
+            # observed on this box (~205s for the 80B); past that, fall
+            # through to ground truth instead of trusting the stale row.
             status = "RELOADING"
             status_reason = f"loading for {time.time() - latest_cycle['start_ts']:.0f}s"
         elif reload_count_5m >= settings.patterns.reload_storm_count_threshold:
@@ -619,6 +641,9 @@ async def get_health_status():
         elif distinct_ctx_15m >= settings.patterns.ctx_churn_distinct_values_threshold:
             status = "DEGRADED"
             status_reason = f"{distinct_ctx_15m} different context sizes in 15 min"
+        elif distinct_model_15m >= settings.patterns.ctx_churn_distinct_values_threshold:
+            status = "DEGRADED"
+            status_reason = f"{distinct_model_15m} different models in 15 min"
         elif resident_model:
             # Ground truth: /api/ps says something is loaded right now, and
             # none of the worse conditions above applied. True whether or
@@ -646,6 +671,7 @@ async def get_health_status():
                                       (latest_cycle["keep_alive_expires_at"] if latest_cycle else None),
             "reload_count_5m": reload_count_5m,
             "distinct_ctx_15m": distinct_ctx_15m,
+            "distinct_model_15m": distinct_model_15m,
             "established_connections": conn["established_count"] if conn else 0,
         }
     return result

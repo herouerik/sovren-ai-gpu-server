@@ -425,6 +425,7 @@ upserts, one row per GPU/service. See `src/storage.py` for exact columns and the
 | **reload_storm** | N+ load cycles in a rolling window (default: 5 in 300s) |
 | **load_cancelled** | A load failed via client-side cancellation, not a crash — a caller's timeout is shorter than this model's load time |
 | **ctx_churn** | 2+ distinct `num_ctx` values requested for the same service within a window (default 900s) — forces a reload on every switch |
+| **model_churn** | 2+ distinct models requested for the same service within the same window — models fighting over one single-model-at-a-time pool. Deliberately does *not* fire for a slow, intentional model switch (e.g. a bandit comparing sovereign candidates every few hours) — a single reload event can never produce 2 distinct values on its own; only 2+ separate reloads inside the same short window do |
 | **near_zero_keep_alive** | A load succeeded, then evicted within seconds — not a crash, a caller set an explicit near-zero `keep_alive` |
 | **connection_pileup** | N+ established connections to the public port (default threshold 6) — a caller is retrying faster than the queue drains |
 | **latency_spike** | `duration_ms > threshold` (default 5s) on a real (non-heartbeat) request |

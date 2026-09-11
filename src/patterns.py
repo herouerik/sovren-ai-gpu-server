@@ -36,6 +36,7 @@ class PatternAnalyzer:
         patterns.extend(await self._detect_reload_storm())
         patterns.extend(await self._detect_load_cancelled())
         patterns.extend(await self._detect_ctx_churn())
+        patterns.extend(await self._detect_model_churn())
         patterns.extend(await self._detect_near_zero_keep_alive())
         # Connection-based
         patterns.extend(await self._detect_connection_pileup())
@@ -134,6 +135,43 @@ class PatternAnalyzer:
                     description=f"{row['service_name']}: {row['distinct_count']} different context "
                                 f"sizes requested in {window}s ({row['values_str']}) — forces a full "
                                 f"reload on every switch",
+                    related_load_cycle_id=row["last_id"],
+                    details={"service": row["service_name"], "values": row["values_str"],
+                              "distinct_count": row["distinct_count"]},
+                ))
+        return patterns
+
+    async def _detect_model_churn(self) -> List[Pattern]:
+        """Same idea as ctx_churn, but tracking model identity instead of
+        context size -- two different models sharing the same context size
+        would otherwise never trip that check. Same window/threshold: a
+        deliberate model switch every few hours (e.g. a slow bandit
+        comparing sovereign candidates) never fires this, since a single
+        reload event can't produce 2 distinct values on its own -- it
+        takes >=2 separate reload events inside the same window, which
+        only genuine rapid flapping between models produces."""
+        threshold = settings.patterns.ctx_churn_distinct_values_threshold
+        window = settings.patterns.ctx_churn_window_seconds
+        cutoff = time.time() - window
+
+        rows = execute("""
+            SELECT service_name, GROUP_CONCAT(DISTINCT model) as values_str,
+                   COUNT(DISTINCT model) as distinct_count, MAX(id) as last_id
+            FROM load_cycles
+            WHERE start_ts > ? AND model IS NOT NULL
+            GROUP BY service_name
+        """, (cutoff,)).fetchall()
+
+        patterns = []
+        for row in rows:
+            if row["distinct_count"] >= threshold:
+                patterns.append(Pattern(
+                    timestamp=time.time(),
+                    pattern_type="model_churn",
+                    severity="warning",
+                    description=f"{row['service_name']}: {row['distinct_count']} different models "
+                                f"requested in {window}s ({row['values_str']}) — models fighting for "
+                                f"the same single-model-at-a-time pool",
                     related_load_cycle_id=row["last_id"],
                     details={"service": row["service_name"], "values": row["values_str"],
                               "distinct_count": row["distinct_count"]},

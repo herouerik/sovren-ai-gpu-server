@@ -355,6 +355,7 @@ function renderGauges(status) {
       s.established_connections >= 6 ? 'crit' : ''));
     el.insertAdjacentHTML('beforeend', mk('Reloads / 5min', s.reload_count_5m, '', s.reload_count_5m >= 5 ? 'warn' : ''));
     el.insertAdjacentHTML('beforeend', mk('Ctx values / 15min', s.distinct_ctx_15m, s.distinct_ctx_15m >= 2 ? 'context churn' : '', s.distinct_ctx_15m >= 2 ? 'warn' : ''));
+    el.insertAdjacentHTML('beforeend', mk('Models / 15min', s.distinct_model_15m, s.distinct_model_15m >= 2 ? 'model churn' : '', s.distinct_model_15m >= 2 ? 'warn' : ''));
   }
 }
 
