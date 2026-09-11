@@ -268,12 +268,16 @@ class LogTailer:
             "method": method,
             "endpoint": path,  # alias for frontend compatibility
             "path": path,
-            # Only a real failure now, not "every line" -- the previous
-            # version stuffed raw_log in here unconditionally, which made
-            # `error IS NULL` false for every row and silently disabled
-            # every pattern detector that filtered on it.
-            "error": entry.raw_line if int(status) >= 400 else None,
-            "raw_log": entry.raw_line
+            # Only a real failure now, not "every line" -- an earlier
+            # version stuffed the raw log in here unconditionally, which
+            # made `error IS NULL` false for every row and silently
+            # disabled every pattern detector that filtered on it. Found
+            # live: this was still using entry.raw_line (the full raw
+            # journald JSON envelope -- boot id, cursor, cgroup, every
+            # field) instead of entry.message (just the clean "[GIN] ..."
+            # line) -- every 4xx/5xx row was carrying a multi-KB blob in
+            # `error` for nothing; nothing ever read it as JSON.
+            "error": entry.message if int(status) >= 400 else None,
         }
 
     # ------------------------------------------------------------------
