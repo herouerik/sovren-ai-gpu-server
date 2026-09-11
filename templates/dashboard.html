@@ -11,8 +11,13 @@
   --surf:    #111010;
   --surf2:   #161514;
   --border:  #1f1e1d;
-  --muted:   #575350;
-  --dim:     #8c8784;
+  /* Secondary/label text -- deliberately a cool, desaturated grey rather
+     than a dimmer shade of --text's warm beige, so labels/timestamps/
+     headers read as a distinct category at a glance, not just "the same
+     text but fainter." Previous values (#575350/#8c8784) were too dark
+     against --bg/--surf2 to read comfortably at all. */
+  --muted:   #8b8e94;
+  --dim:     #aaadb3;
   --text:    #dcd9d4;
   --accent:  #c8681e;
   --accentA: rgba(200,104,30,.11);
@@ -128,16 +133,21 @@ table.data tr:hover td{background:var(--surf2)}
 /* RECENT PROMPTS -- one line each, never wraps. Source (LLM summary vs.
    mechanical truncation) is a left border color, not per-row text -- see
    .prompt-legend below. Summaries can run up to ~200 chars now (see
-   config prompt_insight.fallback_max_chars); rather than ellipsizing that
-   away, the text itself scrolls sideways within its own bounded box --
-   the row's other columns (time/svc/metrics) stay put either way. */
-.prompt-list{display:flex;flex-direction:column;gap:1px;max-height:480px;overflow-y:auto}
-.prompt-item{padding:6px 10px;display:flex;gap:10px;align-items:center;background:var(--surf2);border-left:2px solid var(--blue)}
+   config prompt_insight.fallback_max_chars) -- the text flows to its full
+   natural width (no per-row scrollbar; that made every long row a
+   separate tiny scroll target, not how a normal log view behaves) and
+   the whole list scrolls sideways as one unit when a row needs more room
+   than the panel, exactly like scrolling a wide table. Each row is
+   width:max-content (grows to fit its own content) with a min-width
+   floor so short rows still span the panel; the list container is what
+   actually scrolls, both axes. */
+.prompt-list{display:flex;flex-direction:column;gap:1px;max-height:480px;overflow:auto}
+.prompt-item{padding:6px 10px;display:flex;gap:10px;align-items:center;background:var(--surf2);border-left:2px solid var(--blue);width:max-content;min-width:100%}
 .prompt-item.truncated{border-left-color:var(--muted)}
 .prompt-time{font-size:8px;color:var(--muted);flex-shrink:0;width:56px;font-variant-numeric:tabular-nums}
 .prompt-svc{font-size:8px;color:var(--dim);flex-shrink:0;width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .prompt-metrics{font-size:8px;color:var(--muted);flex-shrink:0;width:150px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.prompt-text{font-size:10px;color:var(--text);flex:1;min-width:0;max-width:520px;overflow-x:auto;overflow-y:hidden;white-space:nowrap;scrollbar-width:thin}
+.prompt-text{font-size:10px;color:var(--text);flex:0 0 auto;white-space:nowrap}
 .prompt-item.truncated .prompt-text{color:var(--dim)}
 .prompt-legend{display:flex;gap:14px;margin-bottom:8px;font-size:9px;color:var(--dim)}
 
