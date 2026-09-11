@@ -186,11 +186,15 @@ def _init_schema(db: sqlite3.Connection):
             throttle_reasons TEXT
         );
 
-        -- Fixed-capacity ring, same scheme as `requests`. ttft_ms and
-        -- tokens_per_second come straight from llama.cpp's own per-task
-        -- "prompt eval time" / "eval time" summary lines -- not estimated,
-        -- not derived from the GIN access log (which structurally can't
-        -- carry them; see requests table notes in README).
+        -- Fixed-capacity ring, same scheme as `requests`. ttft_ms/
+        -- prefill_tps/decode_tps come straight from llama.cpp's own
+        -- per-task "prompt eval time" (prefill) / "eval time" (decode)
+        -- summary lines -- not estimated, not derived from the GIN access
+        -- log (which structurally can't carry them; see requests table
+        -- notes in README). Kept as two separate rates, not one blended
+        -- "tokens/sec", because they behave very differently across
+        -- models and context sizes -- same distinction and field names as
+        -- sovren-ai-benchmarking's own dashboard.
         CREATE TABLE IF NOT EXISTS task_samples (
             id INTEGER PRIMARY KEY,
             timestamp REAL NOT NULL,
@@ -198,7 +202,8 @@ def _init_schema(db: sqlite3.Connection):
             task_id INTEGER,
             total_tokens INTEGER,
             ttft_ms REAL,
-            tokens_per_second REAL
+            prefill_tps REAL,
+            decode_tps REAL
         );
 
         CREATE INDEX IF NOT EXISTS idx_task_samples_timestamp ON task_samples(timestamp);
@@ -259,8 +264,17 @@ def _migrate_schema(db: sqlite3.Connection):
     cols = {row[1] for row in db.execute("PRAGMA table_info(task_samples)").fetchall()}
     if "ttft_ms" not in cols:
         db.execute("ALTER TABLE task_samples ADD COLUMN ttft_ms REAL")
-    if "tokens_per_second" not in cols:
-        db.execute("ALTER TABLE task_samples ADD COLUMN tokens_per_second REAL")
+        cols.add("ttft_ms")
+    if "tokens_per_second" in cols and "decode_tps" not in cols:
+        # tokens_per_second was decode-only from the start; rename rather
+        # than add a new column + orphan the old one.
+        db.execute("ALTER TABLE task_samples RENAME COLUMN tokens_per_second TO decode_tps")
+        cols.discard("tokens_per_second")
+        cols.add("decode_tps")
+    if "decode_tps" not in cols:
+        db.execute("ALTER TABLE task_samples ADD COLUMN decode_tps REAL")
+    if "prefill_tps" not in cols:
+        db.execute("ALTER TABLE task_samples ADD COLUMN prefill_tps REAL")
     db.commit()
 
 

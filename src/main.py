@@ -208,7 +208,8 @@ async def log_capture_orchestrator():
                             "task_id": slot_info["task_id"],
                             "total_tokens": slot_info["total_tokens"],
                             "ttft_ms": slot_info["ttft_ms"],
-                            "tokens_per_second": slot_info["tokens_per_second"],
+                            "prefill_tps": slot_info["prefill_tps"],
+                            "decode_tps": slot_info["decode_tps"],
                         }, capacity=settings.storage.raw_ring_capacity)
                         await broadcast_ws({"type": "slot_release", "data": slot_info})
         except Exception as e:
@@ -333,24 +334,31 @@ async def get_metrics_summary(
         ORDER BY request_count DESC
     """, (cutoff,)).fetchall()]
 
-    # TTFT/TPS come from task_samples (llama.cpp's own per-task timing,
-    # parsed from "prompt eval time" / "eval time" log lines), not from
-    # `requests` -- the GIN access log structurally can't carry them. Merged
-    # in by service_name since `requests.model` is always null in practice
-    # (see README) and model_or_service already falls back to service_name.
+    # TTFT/prefill/decode come from task_samples (llama.cpp's own per-task
+    # timing, parsed from "prompt eval time" / "eval time" log lines), not
+    # from `requests` -- the GIN access log structurally can't carry them.
+    # Kept as two separate rates (not one blended "tokens/sec") because
+    # they behave very differently across models/context sizes -- same
+    # distinction as sovren-ai-benchmarking's own dashboard. Merged in by
+    # service_name since `requests.model` is always null in practice (see
+    # README) and model_or_service already falls back to service_name.
     task_metrics_by_service = {
         r["service_name"]: dict(r)
         for r in execute("""
-            SELECT service_name, AVG(ttft_ms) as avg_ttft_ms, AVG(tokens_per_second) as avg_tps
+            SELECT service_name,
+                   AVG(ttft_ms) as avg_ttft_ms,
+                   AVG(prefill_tps) as avg_prefill_tps,
+                   AVG(decode_tps) as avg_decode_tps
             FROM task_samples
-            WHERE timestamp > ? AND (ttft_ms IS NOT NULL OR tokens_per_second IS NOT NULL)
+            WHERE timestamp > ? AND (ttft_ms IS NOT NULL OR prefill_tps IS NOT NULL OR decode_tps IS NOT NULL)
             GROUP BY service_name
         """, (cutoff,)).fetchall()
     }
     for row in by_model:
         tm = task_metrics_by_service.get(row["service_name"], {})
         row["avg_ttft_ms"] = tm.get("avg_ttft_ms")
-        row["avg_tps"] = tm.get("avg_tps")
+        row["avg_prefill_tps"] = tm.get("avg_prefill_tps")
+        row["avg_decode_tps"] = tm.get("avg_decode_tps")
 
     # By GPU
     by_gpu = execute("""

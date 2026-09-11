@@ -333,11 +333,23 @@ class LogTailer:
     _RE_SLOT_RELEASE = re.compile(r'task\s+(\d+)\s+\|\s+stop processing:\s+n_tokens\s*=\s*(\d+)')
 
     # llama.cpp's own per-task timing summary, logged shortly before slot
-    # release -- "prompt eval time" is the prefill phase before the first
-    # generated token (TTFT), "eval time" is the generation phase and
-    # already carries the average tokens/sec for that task. Neither is
-    # estimated here, just parsed straight from the server's own numbers.
-    _RE_PROMPT_EVAL_TIME = re.compile(r'task\s+(\d+)\s+\|\s+prompt eval time\s*=\s*([\d.]+)\s*ms')
+    # release. Two distinct phases, and they behave very differently across
+    # models/context sizes (same distinction sovren-ai-benchmarking's own
+    # dashboard already draws, same field names for consistency):
+    # - "prompt eval time" = prefill -- processing the prompt before the
+    #   first generated token. This IS ttft_ms, and the line carries its
+    #   own tokens/sec for that phase (prefill_tps) -- prefill is highly
+    #   parallel, so this is normally much higher than decode_tps.
+    # - "eval time" = decode -- the actual token-by-token generation, and
+    #   its tokens/sec (decode_tps) is what's usually meant by "tokens/sec"
+    #   in casual use, but conflating the two hides that a slow response is
+    #   often 90% prefill on a long prompt, not slow generation.
+    # Nothing here is estimated -- both are parsed straight from the
+    # server's own numbers.
+    _RE_PROMPT_EVAL_TIME = re.compile(
+        r'task\s+(\d+)\s+\|\s+prompt eval time\s*=\s*([\d.]+)\s*ms\s*/\s*\d+\s*tokens\s*'
+        r'\(\s*[\d.]+\s*ms per token,\s*([\d.]+)\s*tokens per second\)'
+    )
     _RE_EVAL_TIME = re.compile(
         r'task\s+(\d+)\s+\|\s+eval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens\s*'
         r'\(\s*[\d.]+\s*ms per token,\s*([\d.]+)\s*tokens per second\)'
@@ -345,18 +357,21 @@ class LogTailer:
     _MAX_TRACKED_TASKS = 500  # safety net against a leak if slot release is never seen for a task
 
     def _track_task_metrics(self, entry: LogEntry) -> None:
-        """Opportunistically capture TTFT and avg TPS per task_id as their
-        summary lines stream by, for extract_slot_info() to attach once
-        that task's slot release line arrives (see _RE_SLOT_RELEASE)."""
+        """Opportunistically capture TTFT/prefill_tps and decode_tps per
+        task_id as their summary lines stream by, for extract_slot_info()
+        to attach once that task's slot release line arrives (see
+        _RE_SLOT_RELEASE)."""
         m = self._RE_PROMPT_EVAL_TIME.search(entry.message)
         if m:
-            task_id, ttft_ms = m.groups()
-            self._task_metrics.setdefault(int(task_id), {})["ttft_ms"] = float(ttft_ms)
+            task_id, ttft_ms, prefill_tps = m.groups()
+            metrics = self._task_metrics.setdefault(int(task_id), {})
+            metrics["ttft_ms"] = float(ttft_ms)
+            metrics["prefill_tps"] = float(prefill_tps)
             return
         m = self._RE_EVAL_TIME.search(entry.message)
         if m:
-            task_id, tps = m.groups()
-            self._task_metrics.setdefault(int(task_id), {})["tokens_per_second"] = float(tps)
+            task_id, decode_tps = m.groups()
+            self._task_metrics.setdefault(int(task_id), {})["decode_tps"] = float(decode_tps)
             if len(self._task_metrics) > self._MAX_TRACKED_TASKS:
                 self._task_metrics.clear()
 
@@ -373,7 +388,8 @@ class LogTailer:
             "task_id": int(task_id),
             "total_tokens": int(n_tokens),
             "ttft_ms": metrics.get("ttft_ms"),
-            "tokens_per_second": metrics.get("tokens_per_second"),
+            "prefill_tps": metrics.get("prefill_tps"),
+            "decode_tps": metrics.get("decode_tps"),
         }
 
 

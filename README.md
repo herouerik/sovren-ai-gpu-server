@@ -370,15 +370,19 @@ CREATE TABLE task_samples (
     timestamp REAL NOT NULL,
     service_name TEXT NOT NULL,
     task_id INTEGER,
-    total_tokens INTEGER,               -- from `slot release: ... n_tokens=`
-    ttft_ms REAL,                       -- from `... prompt eval time = N ms ...`
-    tokens_per_second REAL              -- from `... eval time = ... N tokens per second)`
+    total_tokens INTEGER,   -- from `slot release: ... n_tokens=`
+    ttft_ms REAL,           -- from `... prompt eval time = N ms ...` (the prefill phase)
+    prefill_tps REAL,       -- same line's own tokens/sec, for the prefill phase
+    decode_tps REAL         -- from `... eval time = ... N tokens per second)`, the generation phase
 );
 ```
-`ttft_ms`/`tokens_per_second` are llama.cpp's own per-task timing, not estimated and not
-derived from the GIN access log (which structurally can't carry them — see `requests`
-below). `/api/metrics/summary`'s `by_model` rows include the window average of both,
-joined in by `service_name`.
+`ttft_ms`/`prefill_tps`/`decode_tps` are llama.cpp's own per-task timing, not estimated
+and not derived from the GIN access log (which structurally can't carry them — see
+`requests` below). Kept as two separate rates, not one blended "tokens/sec" — prefill is
+highly parallel and normally much faster than decode, and the ratio between them varies a
+lot across models and context sizes (same distinction and field names as
+sovren-ai-benchmarking's own dashboard, for consistency). `/api/metrics/summary`'s
+`by_model` rows include the window average of all three, joined in by `service_name`.
 
 `/api/task_samples` also reports the single most-repeated token count in the window as
 `likely_heartbeat_signature` — a fixed automated health-check probe sends the same
