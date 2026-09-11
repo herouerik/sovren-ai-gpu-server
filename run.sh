@@ -6,4 +6,11 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 mkdir -p static data
+
+# --reload's worker process can outlive a Ctrl-C that only reaches the
+# reloader (see stop.sh) and keep holding the port -- clear it first, every
+# time, so re-running this script is always a clean restart regardless of
+# how the previous run actually died.
+./stop.sh
+
 exec .venv/bin/python -m uvicorn src.main:app --reload --host 0.0.0.0 --port 8082
