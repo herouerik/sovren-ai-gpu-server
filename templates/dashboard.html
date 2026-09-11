@@ -125,14 +125,18 @@ table.data tr:hover td{background:var(--surf2)}
 .pattern-desc{font-size:10px;color:var(--text)}
 .pattern-time{font-size:8px;color:var(--muted);margin-top:2px}
 
-/* RECENT PROMPTS -- one line each, never wraps, always ellipsized */
+/* RECENT PROMPTS -- one line each, never wraps, always ellipsized. Source
+   (LLM summary vs. mechanical truncation) is a left border color, not
+   per-row text -- see .prompt-legend below -- to keep the row's horizontal
+   space for what actually varies in length: the model name. */
 .prompt-list{display:flex;flex-direction:column;gap:1px;max-height:320px;overflow-y:auto}
-.prompt-item{padding:6px 10px;display:flex;gap:10px;align-items:center;background:var(--surf2)}
+.prompt-item{padding:6px 10px;display:flex;gap:10px;align-items:center;background:var(--surf2);border-left:2px solid var(--blue)}
+.prompt-item.truncated{border-left-color:var(--muted)}
 .prompt-time{font-size:8px;color:var(--muted);flex-shrink:0;width:56px;font-variant-numeric:tabular-nums}
-.prompt-svc{font-size:8px;color:var(--dim);flex-shrink:0;width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prompt-svc{font-size:8px;color:var(--dim);flex-shrink:0;width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .prompt-text{font-size:10px;color:var(--text);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .prompt-item.truncated .prompt-text{color:var(--dim)}
-.prompt-src{font-size:7px;color:var(--muted);flex-shrink:0;text-transform:uppercase;letter-spacing:.06em}
+.prompt-legend{display:flex;gap:14px;margin-bottom:8px;font-size:9px;color:var(--dim)}
 
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 @media (max-width:900px){.two-col{grid-template-columns:1fr}}
@@ -231,7 +235,13 @@ canvas{max-width:100%}
 
   <div class="section">
     <div class="section-head"><span class="section-title">Recent Prompts</span></div>
-    <div class="section-body"><div class="prompt-list" id="promptList"></div></div>
+    <div class="section-body">
+      <div class="prompt-legend">
+        <span><span class="legend-dot" style="background:var(--blue)"></span>LLM summary</span>
+        <span><span class="legend-dot" style="background:var(--muted)"></span>mechanical truncation</span>
+      </div>
+      <div class="prompt-list" id="promptList"></div>
+    </div>
   </div>
 
 </div>
@@ -420,7 +430,6 @@ function renderPrompts(prompts) {
       <span class="prompt-time">${fmtTime(p.timestamp)}</span>
       <span class="prompt-svc">${p.service_name}${p.model ? ' · ' + p.model : ''}</span>
       <span class="prompt-text" title="${p.summary.replace(/"/g,'&quot;')}">${p.summary}</span>
-      <span class="prompt-src">${p.source === 'llm' ? 'AI' : 'raw'}</span>
     </div>`).join('');
 }
 
@@ -432,45 +441,98 @@ function renderMetricsTables(summary) {
     <td class="${r.error_count ? 'hw-warn' : ''}">${r.error_count}</td></tr>`).join('')
     : '<tr class="empty-row"><td colspan="4">No requests yet.</td></tr>';
 
-  const callerBody = $('callerTable').querySelector('tbody');
-  callerBody.innerHTML = summary.by_caller.length ? summary.by_caller.map(r => `
-    <tr><td>${r.client_ip}</td><td>${r.request_count}</td>
-    <td>${r.avg_latency_ms ? r.avg_latency_ms.toFixed(0)+'ms' : '—'}</td>
-    <td class="${r.errors ? 'hw-warn' : ''}">${r.errors}</td></tr>`).join('')
-    : '<tr class="empty-row"><td colspan="4">No requests yet.</td></tr>';
+  renderCallerTable(summary.by_caller);
+}
+
+function renderCallerTable(rows) {
+  const thead = $('callerTable').querySelector('thead');
+  const tbody = $('callerTable').querySelector('tbody');
+
+  if (!rows.length) {
+    thead.innerHTML = '<tr><th>Caller IP</th><th>Reqs</th><th>Avg Latency</th><th>Errors</th></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="4">No requests yet.</td></tr>';
+    return;
+  }
+
+  // One row per IP, one column per service -- split metrics, not rows, so
+  // this stays readable as more pools come online (gpu-unified, meta, and
+  // whatever's next) instead of multiplying rows per IP.
+  const services = [...new Set(rows.map(r => r.service_name))].sort();
+  const byIp = {};
+  for (const r of rows) (byIp[r.client_ip] ||= {})[r.service_name] = r;
+
+  const totalFor = (ip) => Object.values(byIp[ip]).reduce(
+    (acc, r) => ({ reqs: acc.reqs + r.request_count, errors: acc.errors + r.errors }),
+    { reqs: 0, errors: 0 });
+  const ips = Object.keys(byIp).sort((a, b) => totalFor(b).reqs - totalFor(a).reqs);
+
+  thead.innerHTML = `<tr><th>Caller IP</th>${services.map(s => `<th>${s}</th>`).join('')}<th>Total</th><th>Errors</th></tr>`;
+  tbody.innerHTML = ips.map(ip => {
+    const cells = services.map(svc => {
+      const r = byIp[ip][svc];
+      if (!r) return '<td style="color:var(--muted)">—</td>';
+      const lat = r.avg_latency_ms ? r.avg_latency_ms.toFixed(0) + 'ms' : '—';
+      return `<td class="${r.errors ? 'hw-warn' : ''}">${r.request_count} <span style="color:var(--muted)">(${lat})</span></td>`;
+    });
+    const t = totalFor(ip);
+    return `<tr><td>${ip}</td>${cells.join('')}<td>${t.reqs}</td><td class="${t.errors ? 'hw-warn' : ''}">${t.errors}</td></tr>`;
+  }).join('');
+}
+
+// Stable color assignment per service, in first-seen order -- multiple
+// pools now exist (gpu-unified, meta, and more as they come online), and
+// each needs a consistently-colored line regardless of how many others
+// are also active.
+const SERVICE_COLORS = ['#c8681e', '#3a6ea5', '#2d8a5a', '#9e8818', '#8a2d2d', '#7a5ea6'];
+const _serviceColorMap = {};
+function colorForService(name) {
+  if (!(name in _serviceColorMap)) {
+    _serviceColorMap[name] = SERVICE_COLORS[Object.keys(_serviceColorMap).length % SERVICE_COLORS.length];
+  }
+  return _serviceColorMap[name];
 }
 
 let connChart = null;
 function renderConnChart(samples) {
-  const byTime = {};
+  const byService = {};
+  const bucketSet = new Set();
   for (const s of samples) {
     const bucket = Math.floor(s.timestamp / 30) * 30;
-    byTime[bucket] = Math.max(byTime[bucket] || 0, s.established_count);
+    bucketSet.add(bucket);
+    const svc = byService[s.service_name] ||= {};
+    svc[bucket] = Math.max(svc[bucket] || 0, s.established_count);
   }
-  const labels = Object.keys(byTime).sort((a,b)=>a-b);
-  const values = labels.map(l => byTime[l]);
-  const labelStrs = labels.map(l => new Date(l*1000).toLocaleTimeString());
+  const buckets = [...bucketSet].sort((a,b)=>a-b);
+  const labelStrs = buckets.map(b => new Date(b*1000).toLocaleTimeString());
+  const services = Object.keys(byService).sort();
+  const datasets = services.map(svc => {
+    const color = colorForService(svc);
+    return {
+      label: svc,
+      data: buckets.map(b => b in byService[svc] ? byService[svc][b] : null),
+      borderColor: color, backgroundColor: color,
+      fill: false, tension: 0.2, pointRadius: 0, spanGaps: false,
+    };
+  });
 
   if (!connChart) {
     connChart = new Chart($('connChart'), {
       type: 'line',
-      data: { labels: labelStrs, datasets: [{
-        label: 'Established connections', data: values,
-        borderColor: '#c8681e', backgroundColor: 'rgba(200,104,30,.1)',
-        fill: true, tension: 0.2, pointRadius: 0,
-      }]},
+      data: { labels: labelStrs, datasets },
       options: {
         responsive: true,
         scales: {
           x: { ticks: { color: '#575350', maxTicksLimit: 8 }, grid: { color: '#1f1e1d' } },
           y: { ticks: { color: '#575350' }, grid: { color: '#1f1e1d' }, beginAtZero: true }
         },
-        plugins: { legend: { display: false } }
+        plugins: { legend: { display: true, labels: {
+          color: '#8c8784', boxWidth: 10, font: { size: 9, family: "'Menlo','Monaco','Courier New',monospace" }
+        } } }
       }
     });
   } else {
     connChart.data.labels = labelStrs;
-    connChart.data.datasets[0].data = values;
+    connChart.data.datasets = datasets;
     connChart.update('none');
   }
 }

@@ -344,16 +344,21 @@ async def get_metrics_summary(
     """, (cutoff,)).fetchall()
 
     # By caller (IP)
+    # One row per (client_ip, service_name) -- multiple pools now exist
+    # (gpu-unified, meta, and more as they come online), and a caller's
+    # traffic pattern per pool is the actually useful signal. The frontend
+    # pivots this into one row per IP with a column per service, rather
+    # than multiplying rows.
     by_caller = execute("""
-        SELECT client_ip,
+        SELECT client_ip, service_name,
                COUNT(*) as request_count,
                AVG(duration_ms) as avg_latency_ms,
                SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) as errors
         FROM requests
         WHERE timestamp > ? AND client_ip IS NOT NULL
-        GROUP BY client_ip
+        GROUP BY client_ip, service_name
         ORDER BY request_count DESC
-        LIMIT 20
+        LIMIT 60
     """, (cutoff,)).fetchall()
 
     # By endpoint
