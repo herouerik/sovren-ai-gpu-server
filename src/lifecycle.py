@@ -16,7 +16,8 @@ import asyncio
 import time
 from typing import Any, Dict, Optional
 
-from src.storage import get_db
+from src.config import settings
+from src.storage import get_db, day_bucket_insert
 
 
 class LifecycleTracker:
@@ -70,12 +71,15 @@ class LifecycleTracker:
                     )
 
             peers = await self._snapshot_peers(service_name, public_port) if public_port else None
-            cur = db.execute("""
-                INSERT INTO load_cycles (service_name, start_ts, ctx_requested, model, outcome, triggering_client_ip)
-                VALUES (?, ?, ?, ?, 'pending', ?)
-            """, (service_name, event["timestamp"], event["ctx_requested"], event["model"], peers))
-            db.commit()
-            self._open_cycle[service_name] = cur.lastrowid
+            row_id = day_bucket_insert("load_cycles", {
+                "service_name": service_name,
+                "start_ts": event["timestamp"],
+                "ctx_requested": event["ctx_requested"],
+                "model": event["model"],
+                "outcome": "pending",
+                "triggering_client_ip": peers,
+            }, timestamp=event["timestamp"], retention_days=settings.storage.event_retention_days)
+            self._open_cycle[service_name] = row_id
 
         elif event["kind"] == "loaded":
             cid = self._open_cycle.get(service_name)

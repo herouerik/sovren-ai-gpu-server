@@ -63,7 +63,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from src.config import settings
-from src.storage import get_db, execute, query_all, query_one, cleanup_old_data
+from src.storage import get_db, execute, query_all, query_one, ring_insert, latest_gpu_samples, query_gpu_samples
 from src.collectors import GPUCollector, OllamaStateCollector, LogTailer, ConnectionsCollector, GPUHardwareCollector
 from src.lifecycle import get_tracker
 from src.patterns import analyze_and_store
@@ -91,9 +91,9 @@ async def broadcast_ws(message: Dict[str, Any]):
 
 async def collector_orchestrator():
     """Background task that runs all collectors and pattern analysis."""
-    last_cleanup = 0.0
     last_gpu_hw = 0.0
-    cleanup_interval_seconds = 60
+    last_wal_checkpoint = 0.0
+    wal_checkpoint_interval_seconds = 60
     tracker = get_tracker()
     while True:
         try:
@@ -131,10 +131,14 @@ async def collector_orchestrator():
                     for p in patterns
                 ]})
 
-            # Cleanup old data (throttled — it also runs a WAL checkpoint, no need every tick)
-            if now - last_cleanup > cleanup_interval_seconds:
-                cleanup_old_data()
-                last_cleanup = now
+            # WAL checkpoint: independent of row retention -- under
+            # continuous concurrent reads (API GETs), SQLite's automatic
+            # checkpoint can starve indefinitely and let the WAL journal
+            # file itself grow unboundedly even though every table is now
+            # bounded. TRUNCATE checkpoints then truncates it back to zero.
+            if now - last_wal_checkpoint > wal_checkpoint_interval_seconds:
+                get_db().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                last_wal_checkpoint = now
 
         except Exception as e:
             print(f"Collector error: {e}")
@@ -169,15 +173,16 @@ async def log_capture_orchestrator():
                     req_info = log_tailer.extract_request_info(entry)
                     if req_info:
                         req_info["service_name"] = svc.name
-                        db = get_db()
-                        db.execute("""
-                            INSERT INTO requests (timestamp, service_name, endpoint, method, client_ip,
-                                status_code, duration_ms, error)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (req_info["timestamp"], req_info["service_name"],
-                              req_info["path"], req_info["method"], req_info["client_ip"],
-                              req_info["status_code"], req_info["duration_ms"], req_info["error"]))
-                        db.commit()
+                        ring_insert("requests", {
+                            "timestamp": req_info["timestamp"],
+                            "service_name": req_info["service_name"],
+                            "endpoint": req_info["path"],
+                            "method": req_info["method"],
+                            "client_ip": req_info["client_ip"],
+                            "status_code": req_info["status_code"],
+                            "duration_ms": req_info["duration_ms"],
+                            "error": req_info["error"],
+                        }, capacity=settings.storage.raw_ring_capacity)
                         await broadcast_ws({"type": "request", "data": req_info})
                         continue  # a line is one of these three kinds, never more than one
 
@@ -191,13 +196,12 @@ async def log_capture_orchestrator():
                     slot_info = log_tailer.extract_slot_info(entry)
                     if slot_info:
                         slot_info["service_name"] = svc.name
-                        db = get_db()
-                        db.execute("""
-                            INSERT INTO task_samples (timestamp, service_name, task_id, total_tokens)
-                            VALUES (?, ?, ?, ?)
-                        """, (slot_info["timestamp"], slot_info["service_name"],
-                              slot_info["task_id"], slot_info["total_tokens"]))
-                        db.commit()
+                        ring_insert("task_samples", {
+                            "timestamp": slot_info["timestamp"],
+                            "service_name": slot_info["service_name"],
+                            "task_id": slot_info["task_id"],
+                            "total_tokens": slot_info["total_tokens"],
+                        }, capacity=settings.storage.raw_ring_capacity)
                         await broadcast_ws({"type": "slot_release", "data": slot_info})
         except Exception as e:
             print(f"Log capture error: {e}")
@@ -394,21 +398,16 @@ async def get_timeseries(
         """, (bucket_seconds, bucket_seconds, cutoff)).fetchall()
 
     elif metric in ("gpu_util", "gpu_mem", "gpu_power", "gpu_temp"):
-        gpu_metric = {"gpu_util": "AVG(gpu_utilization_percent)",
-                      "gpu_mem": "AVG(memory_used_mb)",
-                      "gpu_power": "AVG(power_watts)",
-                      "gpu_temp": "AVG(temperature_c)"}[metric]
-
-        rows = execute(f"""
-            SELECT
-                (CAST(timestamp / ? AS INTEGER) * ?) as bucket,
-                gpu_index as grp,
-                {gpu_metric} as value
-            FROM gpu_samples
-            WHERE timestamp > ?
-            GROUP BY bucket, grp
-            ORDER BY bucket
-        """, (bucket_seconds, bucket_seconds, cutoff)).fetchall()
+        # Pure live/snapshot data, served from the in-memory ring -- see
+        # storage.query_gpu_samples() -- bucketed here in Python instead of
+        # SQL GROUP BY.
+        field = {"gpu_util": "gpu_utilization_percent", "gpu_mem": "memory_used_mb",
+                  "gpu_power": "power_watts", "gpu_temp": "temperature_c"}[metric]
+        buckets: Dict[tuple, List[float]] = {}
+        for s in query_gpu_samples(cutoff):
+            bucket = int(s["timestamp"] // bucket_seconds) * bucket_seconds
+            buckets.setdefault((bucket, s["gpu_index"]), []).append(s[field])
+        rows = [{"bucket": b, "grp": g, "value": sum(vals) / len(vals)} for (b, g), vals in buckets.items()]
 
     else:
         return JSONResponse({"error": "Unknown metric"}, status_code=400)
@@ -433,21 +432,17 @@ async def get_timeseries(
 
 @app.get("/api/gpus")
 async def get_gpus():
-    """Current GPU state."""
+    """Current GPU state -- pure live/snapshot data, served from the
+    in-memory ring (see storage.latest_gpu_samples()), not SQL."""
     cutoff = time.time() - 10
-    rows = execute("""
-        SELECT gs.*, s.service_name
-        FROM gpu_samples gs
-        LEFT JOIN (
-            SELECT DISTINCT gpu_id, service_name
-            FROM requests
-            WHERE timestamp > ?
-        ) s ON gs.gpu_index = s.gpu_id
-        WHERE gs.timestamp = (
-            SELECT MAX(timestamp) FROM gpu_samples gs2 WHERE gs2.gpu_index = gs.gpu_index
-        )
-    """, (cutoff,)).fetchall()
-    return [dict(r) for r in rows]
+    service_by_gpu = {
+        r["gpu_id"]: r["service_name"]
+        for r in execute("SELECT DISTINCT gpu_id, service_name FROM requests WHERE timestamp > ?", (cutoff,)).fetchall()
+    }
+    return [
+        {**s, "service_name": service_by_gpu.get(s["gpu_index"])}
+        for s in latest_gpu_samples()
+    ]
 
 
 @app.get("/api/load_cycles")
@@ -614,8 +609,10 @@ async def get_task_samples(window_seconds: int = Query(3600, ge=60, le=86400)):
 
 
 @app.get("/api/connections")
-async def get_connections(window_seconds: int = Query(3600, ge=60, le=86400)):
-    """Connection-count time series, per service — the pileup signal."""
+async def get_connections(window_seconds: int = Query(3600, ge=60, le=172800)):
+    """Connection-count time series, per service — the pileup signal.
+    Backed by a connection_window_hours (default 48h) ring, at
+    connection_bucket_seconds (default 30s) resolution."""
     cutoff = time.time() - window_seconds
     rows = execute("""
         SELECT timestamp, service_name, established_count
@@ -629,28 +626,18 @@ async def get_gpu_hardware():
     """Latest hardware-health sample per GPU: ECC + page retirement.
 
     This is a checklist, not a chart — these values change rarely, and the
-    interesting state is binary (clean vs. not), not a trend line.
+    interesting state is binary (clean vs. not), not a trend line. The
+    table is a plain upsert keyed by gpu_index, so this is just every row.
     """
-    rows = execute("""
-        SELECT h.* FROM gpu_hardware_samples h
-        WHERE h.timestamp = (
-            SELECT MAX(timestamp) FROM gpu_hardware_samples h2 WHERE h2.gpu_index = h.gpu_index
-        )
-        ORDER BY h.gpu_index
-    """).fetchall()
+    rows = execute("SELECT * FROM gpu_hardware_samples ORDER BY gpu_index").fetchall()
     return [dict(r) for r in rows]
 
 
 @app.get("/api/ollama/services")
 async def get_ollama_services():
-    """Ollama service status and loaded models."""
-    cutoff = time.time() - 30
-    rows = execute("""
-        SELECT * FROM ollama_state
-        WHERE timestamp = (
-            SELECT MAX(timestamp) FROM ollama_state os2 WHERE os2.service_name = ollama_state.service_name
-        )
-    """).fetchall()
+    """Ollama service status and loaded models. The table is a plain
+    upsert keyed by service_name, so this is just every row."""
+    rows = execute("SELECT * FROM ollama_state").fetchall()
     return [dict(r) for r in rows]
 
 

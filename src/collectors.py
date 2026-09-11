@@ -87,19 +87,11 @@ class GPUCollector:
         return samples
 
     async def store_samples(self, samples: List[GPUSample]):
-        """Store samples in SQLite."""
-        from src.storage import get_db
-        db = get_db()
+        """Pure live/snapshot data -- kept in memory only, never persisted
+        to disk. See storage.store_gpu_sample()."""
+        from src.storage import store_gpu_sample
         for s in samples:
-            db.execute("""
-                INSERT INTO gpu_samples (timestamp, gpu_index, name, memory_used_mb, memory_total_mb,
-                    memory_free_mb, gpu_utilization_percent, memory_utilization_percent,
-                    temperature_c, power_watts, power_limit_watts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (s.timestamp, s.gpu_index, s.name, s.memory_used_mb, s.memory_total_mb,
-                  s.memory_free_mb, s.gpu_utilization_percent, s.memory_utilization_percent,
-                  s.temperature_c, s.power_watts, s.power_limit_watts))
-        db.commit()
+            store_gpu_sample(asdict(s))
 
     def cleanup(self):
         if self._initialized:
@@ -154,14 +146,17 @@ class OllamaStateCollector:
         return states
 
     async def store_states(self, states: List[OllamaServiceState]):
-        from src.storage import get_db
-        db = get_db()
+        """Latest known state only, one row per service. See storage.upsert()."""
+        from src.storage import upsert
         for s in states:
-            db.execute("""
-                INSERT INTO ollama_state (timestamp, service_name, port, models_json, tags_json, status)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (s.timestamp, s.service_name, s.port, json.dumps(s.models), json.dumps(s.tags), s.status))
-        db.commit()
+            upsert("ollama_state", {
+                "service_name": s.service_name,
+                "timestamp": s.timestamp,
+                "port": s.port,
+                "models_json": json.dumps(s.models),
+                "tags_json": json.dumps(s.tags),
+                "status": s.status,
+            })
 
     async def close(self):
         await self.client.aclose()
@@ -355,8 +350,6 @@ class ConnectionsCollector:
     from anywhere else -- there is no other place this count exists.
     """
 
-    _RE_PEER = re.compile(r"(\d+\.\d+\.\d+\.\d+):(\d+)\s*$")
-
     async def collect(self) -> List[Dict[str, Any]]:
         samples = []
         now = time.time()
@@ -373,31 +366,23 @@ class ConnectionsCollector:
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
                 lines = stdout.decode(errors="ignore").strip().split("\n")[1:]  # skip header
-                peers = []
-                for line in lines:
-                    m = self._RE_PEER.search(line.split()[-1]) if line.strip() else None
-                    if m:
-                        peers.append(m.group(1))
                 samples.append({
                     "timestamp": now,
                     "service_name": svc.name,
                     "public_port": port,
                     "established_count": len([l for l in lines if l.strip()]),
-                    "peers": peers,
                 })
             except Exception as e:
                 print(f"Connections collector error for {svc.name}: {e}")
         return samples
 
     async def store_samples(self, samples: List[Dict[str, Any]]):
-        from src.storage import get_db
-        db = get_db()
+        """48h-style ring, bucketed at connection_bucket_seconds resolution
+        -- see storage.connection_bucket_upsert(). `peers` is collected for
+        live use only (nothing persists or reads it back after this poll)."""
+        from src.storage import connection_bucket_upsert
         for s in samples:
-            db.execute("""
-                INSERT INTO connection_samples (timestamp, service_name, public_port, established_count, peers_json)
-                VALUES (?, ?, ?, ?, ?)
-            """, (s["timestamp"], s["service_name"], s["public_port"], s["established_count"], json.dumps(s["peers"])))
-        db.commit()
+            connection_bucket_upsert(s["service_name"], s["public_port"], s["timestamp"], s["established_count"])
 
 
 class GPUHardwareCollector:
@@ -470,14 +455,7 @@ class GPUHardwareCollector:
         return samples
 
     async def store_samples(self, samples: List[Dict[str, Any]]):
-        from src.storage import get_db
-        db = get_db()
+        """Latest known state only, one row per GPU. See storage.upsert()."""
+        from src.storage import upsert
         for s in samples:
-            db.execute("""
-                INSERT INTO gpu_hardware_samples
-                    (timestamp, gpu_index, ecc_corrected_volatile, ecc_uncorrected_volatile,
-                     retired_pages_pending, throttle_reasons)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (s["timestamp"], s["gpu_index"], s["ecc_corrected_volatile"],
-                  s["ecc_uncorrected_volatile"], s["retired_pages_pending"], s["throttle_reasons"]))
-        db.commit()
+            upsert("gpu_hardware_samples", s)

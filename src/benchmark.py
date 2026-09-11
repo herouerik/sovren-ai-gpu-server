@@ -129,5 +129,9 @@ class BenchmarkRunner:
 
 
 def store_result(result: BenchmarkResult) -> int:
-    from src.storage import insert
-    return insert("benchmark_results", asdict(result))
+    from src.config import settings
+    from src.storage import day_bucket_insert
+    return day_bucket_insert(
+        "benchmark_results", asdict(result),
+        timestamp=result.timestamp, retention_days=settings.storage.event_retention_days,
+    )

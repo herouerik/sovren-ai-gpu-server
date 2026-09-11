@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import sqlite3
-import time
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Deque, Dict, Generator, List, Optional
 
 from src.config import settings
 
 
 _db: Optional[sqlite3.Connection] = None
 _lock = Lock()
+_ring_counters: Dict[str, int] = {}
 
 
 def get_db() -> sqlite3.Connection:
@@ -23,19 +24,32 @@ def get_db() -> sqlite3.Connection:
             _db = sqlite3.connect(str(db_path), check_same_thread=False)
             _db.row_factory = sqlite3.Row
             _init_schema(_db)
-            _migrate_schema(_db)
         return _db
 
 
 def _init_schema(db: sqlite3.Connection):
-    """Create tables if they don't exist."""
+    """Every table here is bounded by construction: a fixed-capacity ring
+    (`requests`, `task_samples`), fixed day-slots (`patterns`, `load_cycles`,
+    `benchmark_results`), a fixed slot per time-bucket (`connection_samples`),
+    or a single latest-row-per-key upsert (`ollama_state`,
+    `gpu_hardware_samples`). Each write path overwrites its own oldest entry
+    directly -- no periodic cleanup job and no VACUUM are needed, because
+    table size can never grow past its bound regardless of traffic. The old
+    accumulate-forever-then-DELETE design let monitor.db reach 10.8GB (see
+    data/archive/monitor.db.bloated-*) because DELETE frees rows logically
+    but SQLite never shrinks the file for it without a VACUUM.
+    """
     db.executescript("""
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
         PRAGMA cache_size=-32768;
 
+        -- Fixed-capacity ring: `id` is a wrapped counter (id = n % capacity),
+        -- not an autoincrement. INSERT OR REPLACE overwrites whatever
+        -- occupied that slot `raw_ring_capacity` writes ago. See
+        -- storage.ring_insert().
         CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             timestamp REAL NOT NULL,
             service_name TEXT NOT NULL,
             endpoint TEXT NOT NULL,
@@ -75,38 +89,28 @@ def _init_schema(db: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
         CREATE INDEX IF NOT EXISTS idx_requests_client_ip ON requests(client_ip);
 
-        CREATE TABLE IF NOT EXISTS gpu_samples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            gpu_index INTEGER NOT NULL,
-            name TEXT,
-            memory_used_mb REAL,
-            memory_total_mb REAL,
-            memory_free_mb REAL,
-            gpu_utilization_percent REAL,
-            memory_utilization_percent REAL,
-            temperature_c REAL,
-            power_watts REAL,
-            power_limit_watts REAL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_gpu_samples_timestamp ON gpu_samples(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_gpu_samples_gpu ON gpu_samples(gpu_index);
-
+        -- Latest known state only, one row per service (PK) -- every
+        -- consumer (/api/ollama/services, /api/health_status) only ever
+        -- wants "what's resident right now," never history. See
+        -- storage.upsert().
         CREATE TABLE IF NOT EXISTS ollama_state (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            service_name TEXT PRIMARY KEY,
             timestamp REAL NOT NULL,
-            service_name TEXT NOT NULL,
             port INTEGER NOT NULL,
             models_json TEXT,
             tags_json TEXT,
             status TEXT
         );
 
-        CREATE INDEX IF NOT EXISTS idx_ollama_state_timestamp ON ollama_state(timestamp);
-
+        -- Discrete events, retained for exactly `event_retention_days`
+        -- calendar days via day-slots that wrap: day_slot = epoch_day %
+        -- retention_days. Writing into today's slot evicts any stale rows
+        -- already there from a previous, different epoch day. See
+        -- storage.day_bucket_insert().
         CREATE TABLE IF NOT EXISTS patterns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_slot INTEGER NOT NULL,
+            epoch_day INTEGER NOT NULL,
             timestamp REAL NOT NULL,
             pattern_type TEXT NOT NULL,
             severity TEXT NOT NULL,
@@ -121,22 +125,27 @@ def _init_schema(db: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_patterns_timestamp ON patterns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_patterns_type ON patterns(pattern_type);
         CREATE INDEX IF NOT EXISTS idx_patterns_dedup ON patterns(pattern_type, related_request_id);
+        CREATE INDEX IF NOT EXISTS idx_patterns_day_slot ON patterns(day_slot);
 
-        -- The real unit of health on pipeline-parallel hardware: a load cycle,
-        -- not a single request or a single GPU. Every reload storm, timeout
-        -- cascade, and near-zero keep_alive eviction diagnosed on this box
-        -- shows up here as one row.
+        -- The real unit of health on pipeline-parallel hardware: a load
+        -- cycle, not a single request or a single GPU. Same day-slot
+        -- retention as patterns -- event data, not a continuous stream.
+        -- Rows are created 'pending' and later mutated by id (loaded /
+        -- failed / evicted) -- day_slot only governs eviction, `id` stays a
+        -- normal unique key for the lifetime of the cycle.
         CREATE TABLE IF NOT EXISTS load_cycles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_slot INTEGER NOT NULL,
+            epoch_day INTEGER NOT NULL,
             service_name TEXT NOT NULL,
             start_ts REAL NOT NULL,
             ctx_requested INTEGER,
             model TEXT,
-            outcome TEXT NOT NULL DEFAULT 'pending',  -- pending | success | failed
+            outcome TEXT NOT NULL DEFAULT 'pending',
             load_completed_ts REAL,
             failed_ts REAL,
             duration_s REAL,
-            triggering_client_ip TEXT,   -- best-effort, from the nearest connection_samples row
+            triggering_client_ip TEXT,
             keep_alive_expires_at REAL,
             evicted_ts REAL,
             resident_duration_s REAL
@@ -145,50 +154,40 @@ def _init_schema(db: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_load_cycles_start ON load_cycles(start_ts);
         CREATE INDEX IF NOT EXISTS idx_load_cycles_service ON load_cycles(service_name);
         CREATE INDEX IF NOT EXISTS idx_load_cycles_outcome ON load_cycles(outcome);
+        CREATE INDEX IF NOT EXISTS idx_load_cycles_day_slot ON load_cycles(day_slot);
 
-        -- Periodic `ss` snapshots of established connections to each service's
-        -- public-facing port. This is what actually caught the 12-14
-        -- connection pileup that caused a cascading failure storm -- nothing
-        -- in the request/access-log layer can see a queued-but-not-yet-served
-        -- connection.
+        -- `connection_window_hours` sliding window at `connection_bucket_
+        -- seconds` resolution. One row per (service_name, bucket_index); a
+        -- bucket's index recurs every connection_window_hours, so writing
+        -- it overwrites whatever it held one full window ago. Fixed row
+        -- count forever: num_services * (window_hours * 3600 /
+        -- bucket_seconds). See storage.connection_bucket_upsert().
         CREATE TABLE IF NOT EXISTS connection_samples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
             service_name TEXT NOT NULL,
+            bucket_index INTEGER NOT NULL,
+            timestamp REAL NOT NULL,
             public_port INTEGER NOT NULL,
             established_count INTEGER NOT NULL,
-            peers_json TEXT
+            PRIMARY KEY (service_name, bucket_index)
         );
 
         CREATE INDEX IF NOT EXISTS idx_connection_samples_timestamp ON connection_samples(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_connection_samples_service ON connection_samples(service_name);
 
-        -- GPU hardware health, distinct from GPU load (gpu_samples above).
-        -- Polled slowly (default 60s) since ECC counters and retirement
-        -- state change rarely -- this is a health checklist, not a live
-        -- chart, and was completely absent before (only util/mem/temp/power
-        -- were ever sampled).
+        -- Latest known hardware health only, one row per GPU (PK) -- ECC /
+        -- retirement state changes rarely and every consumer only wants
+        -- current status, never a trend line.
         CREATE TABLE IF NOT EXISTS gpu_hardware_samples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gpu_index INTEGER PRIMARY KEY,
             timestamp REAL NOT NULL,
-            gpu_index INTEGER NOT NULL,
             ecc_corrected_volatile INTEGER,
             ecc_uncorrected_volatile INTEGER,
             retired_pages_pending BOOLEAN,
             throttle_reasons TEXT
         );
 
-        CREATE INDEX IF NOT EXISTS idx_gpu_hw_timestamp ON gpu_hardware_samples(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_gpu_hw_gpu ON gpu_hardware_samples(gpu_index);
-
-        -- Per-task token counts from `slot release` log lines -- the only
-        -- place real prompt/completion sizes exist without full request-
-        -- body capture. Persisted (not just broadcast live) so the
-        -- dashboard can show "was this fixed-signature heartbeat traffic
-        -- or genuinely varied real work" over a historical window, not
-        -- just at the instant you happen to be watching.
+        -- Fixed-capacity ring, same scheme as `requests`.
         CREATE TABLE IF NOT EXISTS task_samples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             timestamp REAL NOT NULL,
             service_name TEXT NOT NULL,
             task_id INTEGER,
@@ -197,8 +196,13 @@ def _init_schema(db: sqlite3.Connection):
 
         CREATE INDEX IF NOT EXISTS idx_task_samples_timestamp ON task_samples(timestamp);
 
+        -- Manually-triggered benchmark runs -- naturally low volume, same
+        -- day-slot retention as patterns/load_cycles for consistency (no
+        -- separate cleanup path to maintain).
         CREATE TABLE IF NOT EXISTS benchmark_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_slot INTEGER NOT NULL,
+            epoch_day INTEGER NOT NULL,
             timestamp REAL NOT NULL,
             pool_name TEXT NOT NULL,
             port INTEGER NOT NULL,
@@ -219,64 +223,8 @@ def _init_schema(db: sqlite3.Connection):
 
         CREATE INDEX IF NOT EXISTS idx_benchmark_timestamp ON benchmark_results(timestamp);
         CREATE INDEX IF NOT EXISTS idx_benchmark_pool_model ON benchmark_results(pool_name, model);
+        CREATE INDEX IF NOT EXISTS idx_benchmark_day_slot ON benchmark_results(day_slot);
     """)
-
-
-def _migrate_schema(db: sqlite3.Connection):
-    """`CREATE TABLE IF NOT EXISTS` doesn't add columns to a table that
-    already exists on disk with an older shape. This box's monitor.db
-    predates `related_load_cycle_id` -- add it if missing rather than
-    requiring a fresh database."""
-    cols = {row[1] for row in db.execute("PRAGMA table_info(patterns)").fetchall()}
-    if "related_load_cycle_id" not in cols:
-        db.execute("ALTER TABLE patterns ADD COLUMN related_load_cycle_id INTEGER")
-        db.commit()
-
-    # Rows written before this rebuild used the raw systemd unit name
-    # ("ollama-unified.service") for service_name; everything since uses
-    # the friendly config name ("gpu-unified"). Without this, the same
-    # service shows up as two separate rows in every by-service breakdown
-    # until 7-day retention ages the old rows out on its own -- normalize
-    # once at startup instead of waiting a week for it to stop being
-    # confusing. Keyed off the config, not hardcoded, so it still works if
-    # the systemd unit name ever changes again.
-    marker = db.execute(
-        "SELECT value FROM _migrations WHERE key = 'service_name_normalized'"
-    ).fetchone() if _table_exists(db, "_migrations") else None
-    if marker is None:
-        db.execute("CREATE TABLE IF NOT EXISTS _migrations (key TEXT PRIMARY KEY, value TEXT)")
-        for svc in settings.get_ollama_services():
-            old_name = svc.systemd_service or f"ollama-{svc.name}.service"
-            if old_name == svc.name:
-                continue
-            for table in ("requests",):
-                db.execute(f"UPDATE {table} SET service_name = ? WHERE service_name = ?", (svc.name, old_name))
-        db.execute(
-            "INSERT OR REPLACE INTO _migrations (key, value) VALUES ('service_name_normalized', ?)",
-            (str(time.time()),),
-        )
-        db.commit()
-
-    # The pre-fix `error`-column bug (raw journald JSON stuffed into
-    # `error` unconditionally) produced a real false-positive
-    # quota_exhaustion pattern in testing against this box's own legacy
-    # data -- purge any already-stored pattern rows that match the same
-    # shape the now-fixed detector would reject (error not starting with
-    # the GIN line prefix).
-    db.execute("""
-        DELETE FROM patterns WHERE pattern_type = 'quota_exhaustion'
-        AND id IN (
-            SELECT p.id FROM patterns p JOIN requests r ON p.related_request_id = r.id
-            WHERE r.error IS NOT NULL AND r.error NOT LIKE '[GIN]%'
-        )
-    """)
-    db.commit()
-
-
-def _table_exists(db: sqlite3.Connection, name: str) -> bool:
-    return db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
-    ).fetchone() is not None
 
 
 @contextmanager
@@ -304,32 +252,107 @@ def query_one(query: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def insert(table: str, data: Dict[str, Any]) -> int:
-    """Insert a row and return the lastrowid."""
+def upsert(table: str, data: Dict[str, Any]) -> None:
+    """INSERT OR REPLACE keyed by the table's own primary key (e.g.
+    `service_name` on ollama_state, `gpu_index` on gpu_hardware_samples) --
+    always exactly one row per key, so no history ever accumulates."""
     cols = ", ".join(data.keys())
     placeholders = ", ".join(["?"] * len(data))
-    sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
-    cursor = execute(sql, tuple(data.values()))
-    get_db().commit()
+    sql = f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})"
+    db = get_db()
+    db.execute(sql, tuple(data.values()))
+    db.commit()
+
+
+def ring_insert(table: str, data: Dict[str, Any], capacity: int) -> int:
+    """Insert into a fixed-capacity ring-buffer table (`requests`,
+    `task_samples`). `id` is a wrapped counter, not an autoincrement, so
+    INSERT OR REPLACE always overwrites whatever occupied that slot
+    `capacity` writes ago -- the table can never hold more than `capacity`
+    rows, regardless of traffic. Counter resets to 0 on process restart,
+    which just means the next `capacity` writes re-evict slots 0..N in
+    order rather than true LRU order -- self-corrects within one cycle."""
+    with _lock:
+        n = _ring_counters.get(table, 0)
+        _ring_counters[table] = n + 1
+    row_id = n % capacity
+    row = {"id": row_id, **data}
+    cols = ", ".join(row.keys())
+    placeholders = ", ".join(["?"] * len(row))
+    db = get_db()
+    db.execute(f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})", tuple(row.values()))
+    db.commit()
+    return row_id
+
+
+def day_bucket_insert(table: str, data: Dict[str, Any], timestamp: float, retention_days: int) -> int:
+    """Insert into a table retained for exactly `retention_days` calendar
+    days via day-slots that wrap: day_slot = epoch_day % retention_days.
+    Writing into today's slot first evicts any stale rows already sitting
+    there from a previous, different epoch day -- eviction is a side effect
+    of the write path itself, not a periodic job, and only ever does
+    anything once per slot per day (every other write is a no-op delete)."""
+    epoch_day = int(timestamp // 86400)
+    day_slot = epoch_day % retention_days
+    db = get_db()
+    db.execute(f"DELETE FROM {table} WHERE day_slot = ? AND epoch_day != ?", (day_slot, epoch_day))
+    row = {"day_slot": day_slot, "epoch_day": epoch_day, **data}
+    cols = ", ".join(row.keys())
+    placeholders = ", ".join(["?"] * len(row))
+    cursor = db.execute(f"INSERT INTO {table} ({cols}) VALUES ({placeholders})", tuple(row.values()))
+    db.commit()
     return cursor.lastrowid
 
 
-def cleanup_old_data():
-    """Delete data older than retention_days."""
-    cutoff = time.time() - (settings.storage.retention_days * 86400)
+def connection_bucket_upsert(service_name: str, public_port: int, timestamp: float, established_count: int) -> None:
+    """48h-style sliding window (width: settings.storage.connection_window_
+    hours) at connection_bucket_seconds resolution: one row per (service,
+    bucket_index), and a bucket's index recurs every connection_window_hours
+    -- writing it overwrites whatever it held one full window ago. Fixed
+    row count forever, no cleanup needed."""
+    bucket_seconds = settings.storage.connection_bucket_seconds
+    num_buckets = int(settings.storage.connection_window_hours * 3600 / bucket_seconds)
+    bucket_index = int(timestamp // bucket_seconds) % num_buckets
     db = get_db()
-    db.execute("DELETE FROM requests WHERE timestamp < ?", (cutoff,))
-    db.execute("DELETE FROM gpu_samples WHERE timestamp < ?", (cutoff,))
-    db.execute("DELETE FROM ollama_state WHERE timestamp < ?", (cutoff,))
-    db.execute("DELETE FROM patterns WHERE timestamp < ?", (cutoff,))
-    db.execute("DELETE FROM load_cycles WHERE start_ts < ?", (cutoff,))
-    db.execute("DELETE FROM connection_samples WHERE timestamp < ?", (cutoff,))
-    db.execute("DELETE FROM gpu_hardware_samples WHERE timestamp < ?", (cutoff,))
-    db.execute("DELETE FROM task_samples WHERE timestamp < ?", (cutoff,))
+    db.execute("""
+        INSERT OR REPLACE INTO connection_samples
+            (service_name, bucket_index, timestamp, public_port, established_count)
+        VALUES (?, ?, ?, ?, ?)
+    """, (service_name, bucket_index, timestamp, public_port, established_count))
     db.commit()
-    # WAL mode's automatic checkpoint only fires when no other readers hold the
-    # WAL open; under continuous polling that can starve indefinitely, letting the
-    # WAL file grow unbounded (observed: 7.3GB WAL on an 8.4GB db after ~6 days).
-    # DELETE without a following checkpoint doesn't shrink anything on disk either.
-    # TRUNCATE checkpoints then truncates the WAL file back to zero bytes.
-    db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
+# ---------------------------------------------------------------------------
+# GPU load samples (util/mem/temp/power): pure live/snapshot data, kept in
+# memory only -- never written to disk. Nothing currently queries this past
+# a live dashboard refresh, and it changes every couple of seconds forever;
+# persisting it was the single largest contributor to unbounded growth. A
+# restart loses the last `gpu_sample_memory_minutes` of chart history and
+# refills within a couple of poll cycles.
+# ---------------------------------------------------------------------------
+
+_gpu_memory: Dict[int, Deque[Dict[str, Any]]] = {}
+
+
+def _gpu_memory_capacity() -> int:
+    poll_s = max(1, settings.collectors.gpu_poll_interval_seconds)
+    return max(1, int(settings.storage.gpu_sample_memory_minutes * 60 / poll_s))
+
+
+def store_gpu_sample(sample: Dict[str, Any]) -> None:
+    dq = _gpu_memory.get(sample["gpu_index"])
+    if dq is None:
+        dq = deque(maxlen=_gpu_memory_capacity())
+        _gpu_memory[sample["gpu_index"]] = dq
+    dq.append(sample)
+
+
+def query_gpu_samples(cutoff: float = 0.0) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for dq in _gpu_memory.values():
+        rows.extend(s for s in dq if s["timestamp"] > cutoff)
+    return rows
+
+
+def latest_gpu_samples() -> List[Dict[str, Any]]:
+    return [dq[-1] for dq in _gpu_memory.values() if dq]

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 import psutil
 
 from src.config import settings
-from src.storage import get_db, execute
+from src.storage import get_db, execute, day_bucket_insert, latest_gpu_samples
 
 
 @dataclass
@@ -312,32 +312,26 @@ class PatternAnalyzer:
     async def _detect_gpu_starvation(self) -> List[Pattern]:
         """High VRAM, near-zero compute — a model is resident but idle.
         On this box's pipeline-parallel hardware this is often benign
-        (waiting between requests), so keep the threshold generous."""
+        (waiting between requests), so keep the threshold generous.
+        Reads the in-memory GPU sample ring (see storage.latest_gpu_
+        samples()) -- this data is never persisted to disk."""
         cutoff = time.time() - 300
 
-        gpu_rows = execute("""
-            SELECT gpu_index, MAX(timestamp) as ts FROM gpu_samples WHERE timestamp > ? GROUP BY gpu_index
-        """, (cutoff,)).fetchall()
-
         patterns = []
-        for row in gpu_rows:
-            sample = execute("""
-                SELECT memory_used_mb, memory_total_mb, gpu_utilization_percent, name
-                FROM gpu_samples WHERE gpu_index = ? AND timestamp = ?
-            """, (row["gpu_index"], row["ts"])).fetchone()
-            if not sample:
-                continue
+        for sample in latest_gpu_samples():
+            if sample["timestamp"] <= cutoff:
+                continue  # collector stalled -- nothing fresh for this GPU
             mem_pct = (sample["memory_used_mb"] / sample["memory_total_mb"]) * 100 if sample["memory_total_mb"] else 0
             util = sample["gpu_utilization_percent"]
             if mem_pct > 90 and util < 10:
                 patterns.append(Pattern(
-                    timestamp=row["ts"],
+                    timestamp=sample["timestamp"],
                     pattern_type="gpu_starvation",
                     severity="info",
-                    description=f"GPU {row['gpu_index']} ({sample['name']}): {mem_pct:.0f}% VRAM used, "
+                    description=f"GPU {sample['gpu_index']} ({sample['name']}): {mem_pct:.0f}% VRAM used, "
                                 f"{util:.0f}% compute — likely idle-but-loaded, not necessarily unhealthy",
-                    related_gpu_index=row["gpu_index"],
-                    details={"gpu_index": row["gpu_index"], "gpu_name": sample["name"],
+                    related_gpu_index=sample["gpu_index"],
+                    details={"gpu_index": sample["gpu_index"], "gpu_name": sample["name"],
                               "memory_percent": mem_pct, "utilization_percent": util},
                 ))
         return patterns
@@ -346,12 +340,7 @@ class PatternAnalyzer:
         """Real hardware degradation: pending page retirement or
         uncorrected ECC errors. This is the actual "is the card dying"
         signal — utilization and memory never show it."""
-        rows = execute("""
-            SELECT h.* FROM gpu_hardware_samples h
-            WHERE h.timestamp = (
-                SELECT MAX(timestamp) FROM gpu_hardware_samples h2 WHERE h2.gpu_index = h.gpu_index
-            )
-        """).fetchall()
+        rows = execute("SELECT * FROM gpu_hardware_samples").fetchall()
 
         patterns = []
         for row in rows:
@@ -391,12 +380,10 @@ class PatternAnalyzer:
         if cpu_pct == 0.0:
             return []  # first call after process start, psutil needs a baseline
 
-        any_gpu_active = execute("""
-            SELECT MAX(gpu_utilization_percent) as u FROM gpu_samples
-            WHERE timestamp > ?
-        """, (time.time() - 10,)).fetchone()
+        recent = [s for s in latest_gpu_samples() if s["timestamp"] > time.time() - 10]
+        max_gpu_util = max((s["gpu_utilization_percent"] or 0 for s in recent), default=0)
 
-        if cpu_pct > threshold and any_gpu_active and (any_gpu_active["u"] or 0) < 5:
+        if cpu_pct > threshold and recent and max_gpu_util < 5:
             return [Pattern(
                 timestamp=time.time(),
                 pattern_type="cpu_spillover",
@@ -443,14 +430,16 @@ class PatternAnalyzer:
             if existing:
                 continue
 
-            db.execute("""
-                INSERT INTO patterns (timestamp, pattern_type, severity, description,
-                    related_request_id, related_gpu_index, related_load_cycle_id, details_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (p.timestamp, p.pattern_type, p.severity, p.description,
-                  p.related_request_id, p.related_gpu_index, p.related_load_cycle_id,
-                  json.dumps(p.details) if p.details else None))
-        db.commit()
+            day_bucket_insert("patterns", {
+                "timestamp": p.timestamp,
+                "pattern_type": p.pattern_type,
+                "severity": p.severity,
+                "description": p.description,
+                "related_request_id": p.related_request_id,
+                "related_gpu_index": p.related_gpu_index,
+                "related_load_cycle_id": p.related_load_cycle_id,
+                "details_json": json.dumps(p.details) if p.details else None,
+            }, timestamp=p.timestamp, retention_days=settings.storage.event_retention_days)
 
 
 async def analyze_and_store():

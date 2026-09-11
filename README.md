@@ -52,17 +52,19 @@ whether the box is actually healthy right now — not just a metrics dump.
 |  +- OllamaStateCollector  -> /api/ps, /api/tags polling (5s)            |
 |  +- PatternAnalyzer       -> Runs on collected data each tick           |
 +-------------------------------------------------------------------------+
-|  Storage (SQLite)                                                       |
-|  +- load_cycles table         -> One row per model load attempt        |
-|  +- connection_samples table  -> Established-connection snapshots      |
-|  +- gpu_hardware_samples      -> ECC / retired-page samples            |
-|  +- task_samples table        -> Per-task token counts (slot lines)    |
-|  +- requests table            -> One row per API call (GIN log fields) |
-|  +- gpu_samples table         -> Time-series GPU load metrics          |
-|  +- ollama_state table        -> Model load/unload events              |
-|  +- patterns table            -> Detected anomalies                    |
+|  Storage -- every table bounded by construction, no cleanup job (*)     |
+|  +- load_cycles table         -> load attempts, 14-day day-slots       |
+|  +- connection_samples table  -> 48h ring, 30s buckets                 |
+|  +- gpu_hardware_samples      -> latest-only upsert, one row per GPU   |
+|  +- task_samples table        -> slot-line token counts, fixed ring    |
+|  +- requests table            -> API calls (GIN log fields), fixed ring|
+|  +- gpu_samples                -> in-memory only, never persisted (*)  |
+|  +- ollama_state table        -> latest-only upsert, one row/service   |
+|  +- patterns table            -> detected anomalies, 14-day day-slots  |
 +-------------------------------------------------------------------------+
 ```
+(*) See "Storage retention" below -- src/storage.py's module docstring has
+the full mechanism.
 
 ## Quick Start
 
@@ -92,8 +94,8 @@ The three live data sources are hard platform dependencies, not optional:
 
 - **GPU load metrics** — `GPUCollector` reads stats via NVML (`pynvml`), which needs
   an NVIDIA GPU + driver. On anything else (e.g. Apple Silicon), `nvmlInit()`
-  fails every poll and `gpu_samples` stays empty — the GPU strip will show
-  nothing, silently.
+  fails every poll and the in-memory GPU sample ring stays empty — the GPU
+  strip will show nothing, silently.
 - **GPU hardware health** — `GPUHardwareCollector` shells out to `nvidia-smi -q -d
   ECC,PAGE_RETIREMENT`. Same platform requirement as above; cards without ECC
   reporting enabled at the driver level (consumer GPUs, e.g. an RTX in the same
@@ -154,7 +156,11 @@ collectors:
 
 storage:
   db_path: "data/monitor.db"
-  retention_days: 7
+  event_retention_days: 14        # patterns/alerts, load_cycles, benchmark_results
+  connection_window_hours: 48
+  connection_bucket_seconds: 30
+  raw_ring_capacity: 100000       # requests, task_samples
+  gpu_sample_memory_minutes: 240  # in-memory only, never persisted
 
 patterns:
   latency_spike_threshold_ms: 5000
@@ -181,9 +187,44 @@ here): collectors that need to watch real LAN traffic (`ConnectionsCollector`,
 the lifecycle tracker's trigger-IP snapshot) watch `public_port`; `port` is
 still used to query `/api/ps`/`/api/tags` directly.
 
+### Storage retention
+
+There is no cleanup job and no periodic `DELETE` sweep. Every table is
+bounded by the shape of its own writes, not by a background process --
+`data/monitor.db` was seen to grow to 10.8GB over a few weeks under the old
+accumulate-then-DELETE design (`DELETE` frees rows logically, but SQLite
+never shrinks the file for it without a `VACUUM`, which never ran). Each
+table uses whichever of these fits the data:
+
+- **In-memory only, never persisted** (`gpu_samples`) — pure live/snapshot
+  data that changes every couple of seconds forever. A restart loses the
+  last `gpu_sample_memory_minutes` of chart history and refills within a
+  couple of poll cycles.
+- **Latest-only upsert, one row per key** (`ollama_state`, `gpu_hardware_samples`)
+  — every consumer only ever wants "what's true right now," never history.
+- **Fixed-capacity ring buffer** (`requests`, `task_samples`) — `id` is a
+  wrapped counter (`id = n % raw_ring_capacity`), not an autoincrement;
+  `INSERT OR REPLACE` overwrites whatever occupied that slot
+  `raw_ring_capacity` writes ago. The table can never exceed that many rows,
+  regardless of traffic.
+- **Fixed slot per time-bucket** (`connection_samples`) — one row per
+  `(service_name, bucket_index)`; a bucket's index recurs every
+  `connection_window_hours`, so writing it overwrites what it held one full
+  window ago.
+- **Fixed day-slots** (`patterns`, `load_cycles`, `benchmark_results`) —
+  `day_slot = epoch_day % event_retention_days`. Writing into today's slot
+  evicts any stale rows already there from a different epoch day first --
+  eviction is a side effect of the write path, not a scheduled job.
+
+See `src/storage.py`'s module docstring and the `ring_insert` /
+`day_bucket_insert` / `connection_bucket_upsert` / `upsert` helpers for the
+exact mechanism each table uses.
+
 ## Data Schema
 
 ### load_cycles table (the real health signal)
+14-day day-slot retention (see [Storage retention](#storage-retention)) --
+`day_slot`/`epoch_day` omitted below, they only govern eviction:
 ```sql
 CREATE TABLE load_cycles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,9 +248,11 @@ GPU's telemetry can show, since a reload happens *before* any request completes 
 touches every GPU on this hardware, not one.
 
 ### requests table
+Fixed-capacity ring, `raw_ring_capacity` rows (see [Storage retention](#storage-retention))
+-- `id` is a wrapped counter, not an autoincrement:
 ```sql
 CREATE TABLE requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY,
     timestamp REAL NOT NULL,
     service_name TEXT NOT NULL,
     endpoint TEXT NOT NULL,            -- /api/generate, /api/chat, /api/ps, /api/tags
@@ -237,9 +280,10 @@ CREATE TABLE requests (
 > this request" isn't a question with an answer here.
 
 ### task_samples table
+Same fixed-capacity ring as `requests`:
 ```sql
 CREATE TABLE task_samples (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY,
     timestamp REAL NOT NULL,
     service_name TEXT NOT NULL,
     task_id INTEGER,
@@ -250,10 +294,12 @@ CREATE TABLE task_samples (
 `likely_heartbeat_signature` — a fixed automated health-check probe sends the same
 prompt every time and gets the same token count back; real work doesn't.
 
-### connection_samples / gpu_hardware_samples
+### connection_samples / gpu_hardware_samples / ollama_state
 Periodic snapshots (`ss` established-connection counts; `nvidia-smi -q` ECC/retired-page
-state). See `src/storage.py` for exact columns — both are intentionally simple, append-
-only sample tables, not correlated to individual requests.
+state; `/api/ps` + `/api/tags`). `connection_samples` is a 48h/30s ring bucket keyed by
+`(service_name, bucket_index)`; `gpu_hardware_samples` and `ollama_state` are latest-only
+upserts, one row per GPU/service. See `src/storage.py` for exact columns and the
+[Storage retention](#storage-retention) section above for the mechanism.
 
 ## Pattern Detection
 

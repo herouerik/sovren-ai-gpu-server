@@ -41,7 +41,22 @@ class CollectorsConfig(BaseSettings):
 
 class StorageConfig(BaseSettings):
     db_path: str = "data/monitor.db"
-    retention_days: int = 7
+    # Discrete events (patterns/alerts, load_cycles, benchmark_results):
+    # retained for exactly this many calendar days via day-slots that wrap
+    # and self-evict on write -- see storage.day_bucket_insert().
+    event_retention_days: int = 14
+    # Established-connection sample ring: window width and bucket
+    # resolution -- see storage.connection_bucket_upsert().
+    connection_window_hours: int = 48
+    connection_bucket_seconds: int = 30
+    # Fixed-capacity ring buffers for raw request/task-sample logs -- see
+    # storage.ring_insert(). Sized generously above what any endpoint
+    # actually queries (max window is 24h) so it always covers a full day
+    # even at high traffic.
+    raw_ring_capacity: int = 100_000
+    # GPU load samples (util/mem/temp/power) are kept in memory only, never
+    # persisted -- this many minutes of history per GPU.
+    gpu_sample_memory_minutes: int = 240
 
     model_config = SettingsConfigDict(extra="allow")
 
