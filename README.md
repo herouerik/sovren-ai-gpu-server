@@ -164,7 +164,7 @@ collectors:
 
 storage:
   db_path: "data/monitor.db"
-  event_retention_days: 14        # patterns/alerts, load_cycles, benchmark_results
+  event_retention_days: 14        # patterns/alerts, load_cycles
   connection_window_hours: 48
   connection_bucket_seconds: 30
   raw_ring_capacity: 100000       # requests, task_samples
@@ -227,7 +227,7 @@ table uses whichever of these fits the data:
   `(service_name, bucket_index)`; a bucket's index recurs every
   `connection_window_hours`, so writing it overwrites what it held one full
   window ago.
-- **Fixed day-slots** (`patterns`, `load_cycles`, `benchmark_results`) —
+- **Fixed day-slots** (`patterns`, `load_cycles`) —
   `day_slot = epoch_day % event_retention_days`. Writing into today's slot
   evicts any stale rows already there from a different epoch day first --
   eviction is a side effect of the write path, not a scheduled job.
@@ -403,9 +403,8 @@ CREATE TABLE task_samples (
 and not derived from the GIN access log (which structurally can't carry them — see
 `requests` below). Kept as two separate rates, not one blended "tokens/sec" — prefill is
 highly parallel and normally much faster than decode, and the ratio between them varies a
-lot across models and context sizes (same distinction and field names as
-sovren-ai-benchmarking's own dashboard, for consistency). `/api/metrics/summary`'s
-`by_model` rows include the window average of all three, joined in by `service_name`.
+lot across models and context sizes. `/api/metrics/summary`'s `by_model` rows include the
+window average of all three, joined in by `service_name`.
 
 `/api/task_samples` also reports the single most-repeated token count in the window as
 `likely_heartbeat_signature` — a fixed automated health-check probe sends the same

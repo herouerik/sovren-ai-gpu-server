@@ -27,7 +27,7 @@ storage:
   # Every table is bounded by construction (ring buffers / day-slots /
   # latest-only upserts) -- these settings size the bounds, they aren't a
   # cleanup-job interval. See src/storage.py module docstring.
-  event_retention_days: 14        # patterns/alerts, load_cycles, benchmark_results
+  event_retention_days: 14        # patterns/alerts, load_cycles
   connection_window_hours: 48
   connection_bucket_seconds: 30
   raw_ring_capacity: 100000       # requests, task_samples

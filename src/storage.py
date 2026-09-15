@@ -30,8 +30,8 @@ def get_db() -> sqlite3.Connection:
 
 def _init_schema(db: sqlite3.Connection):
     """Every table here is bounded by construction: a fixed-capacity ring
-    (`requests`, `task_samples`), fixed day-slots (`patterns`, `load_cycles`,
-    `benchmark_results`), a fixed slot per time-bucket (`connection_samples`),
+    (`requests`, `task_samples`), fixed day-slots (`patterns`, `load_cycles`),
+    a fixed slot per time-bucket (`connection_samples`),
     or a single latest-row-per-key upsert (`ollama_state`,
     `gpu_hardware_samples`). Each write path overwrites its own oldest entry
     directly -- no periodic cleanup job and no VACUUM are needed, because
@@ -193,8 +193,7 @@ def _init_schema(db: sqlite3.Connection):
         -- log (which structurally can't carry them; see requests table
         -- notes in README). Kept as two separate rates, not one blended
         -- "tokens/sec", because they behave very differently across
-        -- models and context sizes -- same distinction and field names as
-        -- sovren-ai-benchmarking's own dashboard.
+        -- models and context sizes.
         CREATE TABLE IF NOT EXISTS task_samples (
             id INTEGER PRIMARY KEY,
             timestamp REAL NOT NULL,
@@ -235,35 +234,6 @@ def _init_schema(db: sqlite3.Connection):
         );
 
         CREATE INDEX IF NOT EXISTS idx_prompt_summaries_timestamp ON prompt_summaries(timestamp);
-
-        -- Manually-triggered benchmark runs -- naturally low volume, same
-        -- day-slot retention as patterns/load_cycles for consistency (no
-        -- separate cleanup path to maintain).
-        CREATE TABLE IF NOT EXISTS benchmark_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day_slot INTEGER NOT NULL,
-            epoch_day INTEGER NOT NULL,
-            timestamp REAL NOT NULL,
-            pool_name TEXT NOT NULL,
-            port INTEGER NOT NULL,
-            model TEXT NOT NULL,
-            kind TEXT NOT NULL DEFAULT 'generate',
-            success BOOLEAN NOT NULL,
-            error TEXT,
-            total_duration_ms REAL,
-            load_duration_ms REAL,
-            prompt_eval_count INTEGER,
-            prompt_eval_duration_ms REAL,
-            eval_count INTEGER,
-            eval_duration_ms REAL,
-            tokens_per_second REAL,
-            ttft_ms REAL,
-            response_chars INTEGER
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_benchmark_timestamp ON benchmark_results(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_benchmark_pool_model ON benchmark_results(pool_name, model);
-        CREATE INDEX IF NOT EXISTS idx_benchmark_day_slot ON benchmark_results(day_slot);
     """)
 
 

@@ -410,8 +410,8 @@ class PatternAnalyzer:
         to a live psutil check rather than per-request attribution (the
         original design assumed a request->GPU->CPU mapping that doesn't
         exist on pipeline-parallel hardware where every request touches
-        every GPU). A real prior incident on this fleet (AHA-1083, wrong
-        Ollama port routed inference to a CPU-serving fallback) is exactly
+        every GPU). A real prior incident (a misconfigured Ollama port
+        silently routed inference to a CPU-serving fallback) is exactly
         the failure mode this exists to catch."""
         threshold = settings.patterns.cpu_spillover_threshold_percent
         cpu_pct = psutil.cpu_percent(interval=None)

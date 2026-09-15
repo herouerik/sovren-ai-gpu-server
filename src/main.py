@@ -366,10 +366,9 @@ async def get_metrics_summary(
     # timing, parsed from "prompt eval time" / "eval time" log lines), not
     # from `requests` -- the GIN access log structurally can't carry them.
     # Kept as two separate rates (not one blended "tokens/sec") because
-    # they behave very differently across models/context sizes -- same
-    # distinction as sovren-ai-benchmarking's own dashboard. Merged in by
-    # service_name since `requests.model` is always null in practice (see
-    # README) and model_or_service already falls back to service_name.
+    # they behave very differently across models/context sizes. Merged in
+    # by service_name since `requests.model` is always null in practice
+    # (see README) and model_or_service already falls back to service_name.
     task_metrics_by_service = {
         r["service_name"]: dict(r)
         for r in execute("""
@@ -735,39 +734,6 @@ async def get_ollama_services():
     return [dict(r) for r in rows]
 
 
-@app.get("/api/benchmarks")
-async def get_benchmarks(
-    limit: int = Query(200, le=2000),
-    pool_name: Optional[str] = None,
-    model: Optional[str] = None,
-    kind: Optional[str] = None
-):
-    """Get stored benchmark run results."""
-    conditions = []
-    params = []
-
-    if pool_name:
-        conditions.append("pool_name = ?")
-        params.append(pool_name)
-    if model:
-        conditions.append("model = ?")
-        params.append(model)
-    if kind:
-        conditions.append("kind = ?")
-        params.append(kind)
-
-    where = "WHERE " + " AND ".join(conditions) if conditions else ""
-
-    rows = execute(f"""
-        SELECT * FROM benchmark_results
-        {where}
-        ORDER BY timestamp DESC
-        LIMIT ?
-    """, tuple(params + [limit])).fetchall()
-
-    return [dict(r) for r in rows]
-
-
 @app.get("/api/patterns")
 async def get_patterns(
     limit: int = Query(50, le=500),
@@ -912,15 +878,15 @@ async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
             resp = await client.post(
                 f"http://127.0.0.1:{summarizer.port}/api/generate",
                 json={"model": summarizer.model, "prompt": instruction, "stream": False,
-                      # num_ctx pinned -- left to Ollama's auto-sizing (based on prompt
-                      # length), every request could pick a different context size, and
-                      # with OLLAMA_MAX_LOADED_MODELS=1 every size change forces a full
-                      # model reload. Observed live: alternating short/long mirrored
+                      # num_ctx pinned, not left to Ollama's auto-sizing (based on prompt
+                      # length) -- with OLLAMA_MAX_LOADED_MODELS=1, every size change forces
+                      # a full model reload. Observed live: alternating short/long mirrored
                       # prompts flipped this between 4096 and 32768 on nearly every call
-                      # (~2s reload each) -- exactly what put this service into DEGRADED
-                      # via ctx_churn. 4096 comfortably covers instruction +
-                      # prompt_text[:4000] + the num_predict budget below.
-                      "options": {"num_predict": 80, "num_ctx": 4096}},
+                      # (~2s reload each), putting this service into DEGRADED via ctx_churn.
+                      # 16384 must match ollama-meta.service's OLLAMA_CONTEXT_LENGTH default
+                      # (used by any caller that omits num_ctx, e.g. .117) -- any mismatch
+                      # between the two reproduces the same reload flap at different numbers.
+                      "options": {"num_predict": 80, "num_ctx": 16384}},
             )
         resp.raise_for_status()
         raw = resp.json().get("response", "")

@@ -338,8 +338,7 @@ class LogTailer:
 
     # llama.cpp's own per-task timing summary, logged shortly before slot
     # release. Two distinct phases, and they behave very differently across
-    # models/context sizes (same distinction sovren-ai-benchmarking's own
-    # dashboard already draws, same field names for consistency):
+    # models/context sizes:
     # - "prompt eval time" = prefill -- processing the prompt before the
     #   first generated token. This IS ttft_ms, and the line carries its
     #   own tokens/sec for that phase (prefill_tps) -- prefill is highly
