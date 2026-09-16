@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 import psutil
 
 from src.config import settings
-from src.storage import get_db, execute, day_bucket_insert, latest_gpu_samples
+from src.storage import get_db, execute, day_bucket_insert, latest_gpu_samples, resident_model
 
 
 @dataclass
@@ -37,6 +37,7 @@ class PatternAnalyzer:
         patterns.extend(await self._detect_load_cancelled())
         patterns.extend(await self._detect_ctx_churn())
         patterns.extend(await self._detect_model_churn())
+        patterns.extend(await self._detect_rejected_model_mismatch())
         patterns.extend(await self._detect_near_zero_keep_alive())
         # Connection-based
         patterns.extend(await self._detect_connection_pileup())
@@ -175,6 +176,52 @@ class PatternAnalyzer:
                     related_load_cycle_id=row["last_id"],
                     details={"service": row["service_name"], "values": row["values_str"],
                               "distinct_count": row["distinct_count"]},
+                ))
+        return patterns
+
+    async def _detect_rejected_model_mismatch(self) -> List[Pattern]:
+        """Requests naming a model that doesn't match what's actually
+        resident -- distinct from model_churn, which only sees real load
+        attempts via load_cycles. A caller whose num_ctx/model mismatch is
+        severe enough trips Ollama's own fast-reject admission check
+        (instant 503, no load attempt, no journald "starting llama-server"
+        line at all -- confirmed live: 3 rejections in a row, zero new
+        load_cycles rows) -- load_cycles-based detection is structurally
+        blind to this. This reads the mirrored request's own declared
+        `model` field instead (prompt_summaries), so it catches the
+        rejected-before-ever-attempting-to-load case too. Real, wasted
+        traffic even though nothing ever reloads -- worth its own pattern,
+        not folded into model_churn, since the failure mode and the fix
+        (caller sending a bad request) are different from actual thrashing
+        (caller legitimately switching models faster than the pool can
+        keep up)."""
+        threshold = settings.patterns.rejected_model_mismatch_count_threshold
+        window = settings.patterns.rejected_model_mismatch_window_seconds
+        cutoff = time.time() - window
+
+        rows = execute("""
+            SELECT service_name, model, COUNT(*) as request_count, MAX(id) as last_id
+            FROM prompt_summaries
+            WHERE timestamp > ? AND model IS NOT NULL
+            GROUP BY service_name, model
+        """, (cutoff,)).fetchall()
+
+        patterns = []
+        for row in rows:
+            resident = resident_model(row["service_name"])
+            if not resident or row["model"] == resident:
+                continue
+            if row["request_count"] >= threshold:
+                patterns.append(Pattern(
+                    timestamp=time.time(),
+                    pattern_type="rejected_model_mismatch",
+                    severity="warning",
+                    description=f"{row['service_name']}: {row['request_count']} requests for "
+                                f"'{row['model']}' in {window}s, but '{resident}' is what's "
+                                f"actually resident — rejected outright each time, not reloading "
+                                f"(see model_churn for real reload thrashing)",
+                    details={"service": row["service_name"], "requested_model": row["model"],
+                              "resident_model": resident, "request_count": row["request_count"]},
                 ))
         return patterns
 

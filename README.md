@@ -425,6 +425,7 @@ upserts, one row per GPU/service. See `src/storage.py` for exact columns and the
 | **load_cancelled** | A load failed via client-side cancellation, not a crash — a caller's timeout is shorter than this model's load time |
 | **ctx_churn** | 2+ distinct `num_ctx` values requested for the same service within a window (default 900s) — forces a reload on every switch |
 | **model_churn** | 2+ distinct models requested for the same service within the same window — models fighting over one single-model-at-a-time pool. Deliberately does *not* fire for a slow, intentional model switch (e.g. a bandit comparing sovereign candidates every few hours) — a single reload event can never produce 2 distinct values on its own; only 2+ separate reloads inside the same short window do |
+| **rejected_model_mismatch** | N+ requests (default 3 in 300s) naming a model that doesn't match what's actually resident — distinct from `model_churn`, which only sees real load attempts via `load_cycles`. A caller whose `num_ctx`/model mismatch is severe enough trips Ollama's own fast-reject admission check (instant 503, no load attempt, no journald "starting llama-server" line at all) — `load_cycles`-based detection is structurally blind to this. Reads the mirrored request's own declared `model` field instead (`prompt_summaries`), so it catches rejected-before-ever-attempting-to-load traffic too — real, wasted requests fighting a single-model-at-a-time pool even though nothing ever actually reloads |
 | **near_zero_keep_alive** | A load succeeded, then evicted within seconds — not a crash, a caller set an explicit near-zero `keep_alive` |
 | **connection_pileup** | N+ established connections to the public port (default threshold 6) — a caller is retrying faster than the queue drains |
 | **latency_spike** | `duration_ms > threshold` (default 5s) on a real (non-heartbeat) request |
@@ -449,6 +450,7 @@ upserts, one row per GPU/service. See `src/storage.py` for exact columns and the
 | `GET /api/gpus` | Current GPU load state |
 | `GET /api/ollama/services` | Ollama service status & loaded models |
 | `GET /api/patterns` | Detected anomalies |
+| `GET /api/requested_models` | Every distinct model actually *requested* per service in a window (default 1h), with a count and whether it matches what's resident — the data source for the "Requested Models" dashboard panel and the `rejected_model_mismatch` pattern; catches wasted/rejected traffic that never shows up in `load_cycles` |
 | `GET /api/prompt_summaries` | Recent one-line prompt summaries (see [Prompt insight](#prompt-insight)) |
 | `GET /api/prompt_raw/{id}` | Real prompt text behind one summary, in-memory only (see [Prompt insight](#prompt-insight)) |
 | `POST /api/prompt_mirror` | Reverse-proxy mirror target — not for direct use, see [Prompt insight](#prompt-insight) |
@@ -466,7 +468,11 @@ Open `http://localhost:8082` — single-page, health-first layout:
 - **GPU compute strip** — live per-GPU utilization
 - **Connections chart** — established-connection count over time
 - **Real work vs. heartbeat** — how much of recent traffic is genuine vs. a health probe
-- **Patterns & alerts**, **requests by model/service**, **requests by caller IP**
+- **Patterns & alerts**, **requested models vs. resident** (every model actually requested
+  per pool, not just what's loaded — flags any row that doesn't match what's resident, the
+  only place a rejected-before-loading mismatch is visible; see `rejected_model_mismatch`
+  in [Pattern Detection](#pattern-detection)), **requests by model/service**, **requests by
+  caller IP**
 - **Recent prompts** — scrollable, one-line-each summaries of the last 20 prompts
   (empty until [Prompt insight](#prompt-insight) is configured)
 - **Header** — live clock plus "monitoring since" (this process's own start time,

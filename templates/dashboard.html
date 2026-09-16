@@ -239,9 +239,16 @@ canvas{max-width:100%}
 
     <!-- PATTERNS -->
     <div class="section">
-      <div class="section-head"><span class="section-title" title="Automatically detected anomalies: reload storms, load-cancel timeout cascades, context-size churn, connection pileups, latency spikes, delete attempts, quota/rate-limit signals, GPU starvation, hardware faults, CPU spillover. Retained 14 days.">Patterns &amp; Alerts</span></div>
+      <div class="section-head"><span class="section-title" title="Automatically detected anomalies: reload storms, load-cancel timeout cascades, context-size churn, rejected model-mismatch requests, connection pileups, latency spikes, delete attempts, quota/rate-limit signals, GPU starvation, hardware faults, CPU spillover. Retained 14 days.">Patterns &amp; Alerts</span></div>
       <div class="section-body"><div class="pattern-list" id="patternList"></div></div>
     </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head"><span class="section-title" title="Every distinct model name actually requested per pool, over the last hour -- not just what's resident. A caller whose model/num_ctx mismatch is severe enough gets rejected by Ollama before ever attempting a load, so it never shows up as a load cycle -- this is the only place that traffic is visible. Any row not matching the pool's current resident model is flagged red: real, wasted requests fighting a single-model-at-a-time pool, whether or not they ever cause an actual reload.">Requested Models (vs. Resident)</span></div>
+    <div class="section-body"><table class="data" id="requestedModelsTable"><thead>
+      <tr><th>Service</th><th>Model Requested</th><th>Count / 1h</th><th>Last Seen</th><th>Status</th></tr>
+    </thead><tbody></tbody></table></div>
   </div>
 
   <div class="two-col">
@@ -489,6 +496,33 @@ function renderPatterns(patterns) {
     </div>`).join('');
 }
 
+function renderRequestedModels(rows) {
+  const thead = $('requestedModelsTable').querySelector('thead');
+  const tbody = $('requestedModelsTable').querySelector('tbody');
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No requests yet.</td></tr>';
+    return;
+  }
+
+  // Grouped by service, heaviest requester first within each -- mismatch
+  // rows sort to the top of their service so the unhealthy ones are the
+  // first thing seen, not buried under a legitimate high-volume row.
+  const services = [...new Set(rows.map(r => r.service_name))].sort();
+  tbody.innerHTML = services.flatMap(svc => {
+    const svcRows = rows.filter(r => r.service_name === svc)
+      .sort((a, b) => (a.matches_resident - b.matches_resident) || (b.request_count - a.request_count));
+    return svcRows.map(r => `
+      <tr>
+        <td>${svc}</td>
+        <td>${r.model}</td>
+        <td>${r.request_count}</td>
+        <td>${fmtTime(r.last_seen)}</td>
+        <td class="${r.matches_resident ? 'hw-ok' : 'hw-crit'}">${r.matches_resident ? 'resident' : '⚠ mismatch'}</td>
+      </tr>`);
+  }).join('');
+}
+
 function fmtPromptMetrics(p) {
   // Metrics arrive asynchronously, well after the row itself is created
   // (see storage.attach_prompt_metrics -- best-effort correlation by
@@ -679,7 +713,7 @@ function renderConnChart(samples) {
 
 async function refreshAll() {
   try {
-    const [status, cycles, hw, loadSeries, tasks, conns, patterns, summary, prompts] = await Promise.all([
+    const [status, cycles, hw, loadSeries, tasks, conns, patterns, summary, prompts, requestedModels] = await Promise.all([
       getJSON('/api/health_status'),
       getJSON('/api/load_cycles?limit=200'),
       getJSON('/api/gpu_hardware'),
@@ -689,6 +723,7 @@ async function refreshAll() {
       getJSON('/api/patterns?limit=30'),
       getJSON('/api/metrics/summary?window_seconds=3600'),
       getJSON('/api/prompt_summaries?limit=100'),
+      getJSON('/api/requested_models?window_seconds=3600'),
     ]);
     renderHero(status);
     renderGauges(status);
@@ -698,6 +733,7 @@ async function refreshAll() {
     renderTaskSummary(tasks);
     renderConnChart(conns);
     renderPatterns(patterns);
+    renderRequestedModels(requestedModels);
     renderMetricsTables(summary);
     renderPrompts(prompts);
   } catch (e) {

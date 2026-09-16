@@ -75,6 +75,14 @@ class PatternsConfig(BaseSettings):
     ctx_churn_window_seconds: int = 900
     near_zero_keep_alive_seconds: int = 5
     connection_pileup_threshold: int = 6
+    # A caller whose num_ctx/model mismatch is severe enough gets rejected
+    # by Ollama's own fast-reject path (instant 503, no load attempt at
+    # all) -- load_cycles-based ctx_churn/model_churn never see this. This
+    # threshold/window is deliberately tighter than ctx_churn's (300s vs
+    # 900s): a rejected-outright caller retrying every ~90s should trip
+    # this well before load_cycles-based detection could ever catch it.
+    rejected_model_mismatch_count_threshold: int = 3
+    rejected_model_mismatch_window_seconds: int = 300
 
     model_config = SettingsConfigDict(extra="allow")
 

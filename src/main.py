@@ -68,7 +68,7 @@ from src.config import settings
 from src.storage import (
     get_db, execute, query_all, query_one, ring_insert, upgrade_ring_row,
     attach_prompt_metrics, cache_raw_prompt, get_raw_prompt,
-    latest_gpu_samples, query_gpu_samples,
+    latest_gpu_samples, query_gpu_samples, resident_model,
 )
 from src.collectors import GPUCollector, OllamaStateCollector, LogTailer, ConnectionsCollector, GPUHardwareCollector
 from src.lifecycle import get_tracker
@@ -941,6 +941,40 @@ async def prompt_mirror(request: Request):
 async def get_prompt_summaries(limit: int = Query(20, le=200)):
     rows = execute("SELECT * FROM prompt_summaries ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/requested_models")
+async def get_requested_models(window_seconds: int = Query(3600, le=86400)):
+    """Per service, every distinct model actually *requested* in the
+    mirrored traffic, with a count and whether it matches what's actually
+    resident right now. This is deliberately a different signal than
+    `distinct_model_15m` in health_status (which comes from `load_cycles`,
+    i.e. real load attempts only) -- a caller whose request mismatches
+    badly enough gets rejected by Ollama before ever attempting a load, so
+    it never appears there. Reading it from `prompt_summaries` instead
+    catches wasted-but-rejected traffic too, which is exactly what the
+    `rejected_model_mismatch` pattern also watches for -- this endpoint is
+    what the dashboard's "Requested Models" panel renders."""
+    cutoff = time.time() - window_seconds
+    rows = execute("""
+        SELECT service_name, model, COUNT(*) as request_count, MAX(timestamp) as last_seen
+        FROM prompt_summaries
+        WHERE timestamp > ? AND model IS NOT NULL
+        GROUP BY service_name, model
+        ORDER BY service_name, request_count DESC
+    """, (cutoff,)).fetchall()
+
+    result = []
+    for r in rows:
+        resident = resident_model(r["service_name"])
+        result.append({
+            "service_name": r["service_name"],
+            "model": r["model"],
+            "request_count": r["request_count"],
+            "last_seen": r["last_seen"],
+            "matches_resident": resident is not None and r["model"] == resident,
+        })
+    return result
 
 
 @app.get("/api/prompt_raw/{row_id}")

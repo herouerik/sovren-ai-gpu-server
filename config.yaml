@@ -53,6 +53,8 @@ patterns:
   ctx_churn_window_seconds: 900
   near_zero_keep_alive_seconds: 5
   connection_pileup_threshold: 6
+  rejected_model_mismatch_count_threshold: 3
+  rejected_model_mismatch_window_seconds: 300
 
 server:
   host: "0.0.0.0"

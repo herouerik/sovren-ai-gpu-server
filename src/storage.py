@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections import deque
 from contextlib import contextmanager
@@ -287,6 +288,20 @@ def query_all(query: str, params: tuple = ()) -> List[Dict[str, Any]]:
 def query_one(query: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
     row = execute(query, params).fetchone()
     return dict(row) if row else None
+
+
+def resident_model(service_name: str) -> Optional[str]:
+    """Ground truth for "what's actually loaded right now" on a service --
+    a direct /api/ps poll (ollama_state), not load_cycles (which only has
+    rows for reloads this monitor has personally witnessed since it
+    started)."""
+    row = query_one(
+        "SELECT models_json FROM ollama_state WHERE service_name = ?", (service_name,)
+    )
+    if not row or not row["models_json"]:
+        return None
+    models = json.loads(row["models_json"])
+    return models[0]["name"] if models else None
 
 
 def upsert(table: str, data: Dict[str, Any]) -> None:
