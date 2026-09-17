@@ -34,11 +34,21 @@ class GPUSample:
 class GPUCollector:
     def __init__(self):
         self._initialized = False
+        self._available = True
         self._handles = []
 
     def _init_nvml(self):
         if not self._initialized:
-            nvmlInit()
+            try:
+                nvmlInit()
+            except Exception as e:
+                # No NVML on this host (e.g. Apple Silicon / non-NVIDIA) --
+                # degrade to "no GPU samples" rather than taking down the
+                # whole collector_orchestrator cycle every poll.
+                print(f"NVML unavailable, GPU telemetry disabled: {e}")
+                self._available = False
+                self._initialized = True
+                return
             for i in range(8):  # Support up to 8 GPUs
                 try:
                     handle = nvmlDeviceGetHandleByIndex(i)
@@ -49,6 +59,8 @@ class GPUCollector:
 
     async def collect(self) -> List[GPUSample]:
         self._init_nvml()
+        if not self._available:
+            return []
         samples = []
         now = time.time()
 
@@ -94,7 +106,7 @@ class GPUCollector:
             store_gpu_sample(asdict(s))
 
     def cleanup(self):
-        if self._initialized:
+        if self._initialized and self._available:
             nvmlShutdown()
 
 
