@@ -231,7 +231,8 @@ def _init_schema(db: sqlite3.Connection):
             total_tokens INTEGER,
             ttft_ms REAL,
             prefill_tps REAL,
-            decode_tps REAL
+            decode_tps REAL,
+            client_ip TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_prompt_summaries_timestamp ON prompt_summaries(timestamp);
@@ -262,6 +263,8 @@ def _migrate_schema(db: sqlite3.Connection):
         if col not in prompt_cols:
             coltype = "INTEGER" if col == "total_tokens" else "REAL"
             db.execute(f"ALTER TABLE prompt_summaries ADD COLUMN {col} {coltype}")
+    if "client_ip" not in prompt_cols:
+        db.execute("ALTER TABLE prompt_summaries ADD COLUMN client_ip TEXT")
     db.commit()
 
 

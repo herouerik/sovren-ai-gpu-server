@@ -147,6 +147,7 @@ table.data tr:hover td{background:var(--surf2)}
 .prompt-item.truncated{border-left-color:var(--muted)}
 .prompt-time{font-size:8px;color:var(--muted);flex-shrink:0;width:56px;font-variant-numeric:tabular-nums}
 .prompt-svc{font-size:8px;color:var(--dim);flex-shrink:0;width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prompt-ip{font-size:8px;color:var(--muted);flex-shrink:0;width:100px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .prompt-metrics{font-size:8px;color:var(--muted);flex-shrink:0;width:150px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .prompt-text{font-size:10px;color:var(--text);flex:0 0 auto;white-space:nowrap}
 .prompt-item.truncated .prompt-text{color:var(--dim)}
@@ -598,6 +599,7 @@ function renderPrompts(prompts) {
     <div class="prompt-item ${p.source}">
       <span class="prompt-time">${fmtTime(p.timestamp)}</span>
       <span class="prompt-svc">${p.service_name}${p.model ? ' · ' + p.model : ''}</span>
+      <span class="prompt-ip" title="client IP">${p.client_ip || '—'}</span>
       <span class="prompt-metrics" title="${fmtPromptMetricsTitle(p)}">${fmtPromptMetrics(p)}</span>
       <span class="prompt-text" title="${p.summary.replace(/"/g,'&quot;')}"
             onclick="togglePromptPopup(this, ${p.id}, ${p.timestamp}, '${p.service_name}', ${p.model ? `'${p.model.replace(/'/g,"\\'")}'`  : 'null'})">${p.summary}</span>

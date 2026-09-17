@@ -274,6 +274,7 @@ server {
         proxy_pass http://127.0.0.1:8082/api/prompt_mirror;
         proxy_set_header X-Original-URI $request_uri;
         proxy_set_header X-Service-Name "gpu-unified";  # match the service's `name` in config.yaml
+        proxy_set_header X-Real-IP $remote_addr;        # client IP shown in the Recent Prompts panel
     }
 }
 ```

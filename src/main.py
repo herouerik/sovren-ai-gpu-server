@@ -915,6 +915,7 @@ async def prompt_mirror(request: Request):
 
     endpoint = request.headers.get("x-original-uri", request.url.path)
     service_name = request.headers.get("x-service-name", "unknown")
+    client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else None)
     prompt_text = _extract_prompt_text(endpoint, body)
     if not prompt_text:
         return {"ok": True}
@@ -928,6 +929,7 @@ async def prompt_mirror(request: Request):
         "endpoint": endpoint,
         "summary": _truncate_to_words(prompt_text, cfg.fallback_max_words, cfg.fallback_max_chars),
         "source": "truncated",
+        "client_ip": client_ip,
     }, capacity=cfg.ring_capacity)
     cache_raw_prompt(row_id, timestamp, prompt_text)
 
