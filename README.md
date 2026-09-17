@@ -82,7 +82,7 @@ only appear when run on the actual Ollama GPU server (Linux + NVIDIA + systemd
 
 ```bash
 cd sovren-ai-gpu-server
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -95,6 +95,18 @@ mkdir -p static data
 
 # Open dashboard at http://localhost:8082
 ```
+
+> **macOS note:** use `python3` (not `python`) for the venv step above — macOS
+> doesn't ship a `python` command by default, only `python3`, so `python -m venv`
+> fails with something like `command not found: python`/`no such file or
+> directory: pip` (there's no `.venv` to hold a `pip` if the venv step never
+> ran). Once the venv is created with `python3`, everything inside it —
+> `pip`, `python`, `./run.sh`, `python -m src.main` — resolves correctly on its
+> own, no further changes needed. This is purely a venv-creation quirk, not a
+> platform requirement: as noted in [Requirements](#requirements) below, the
+> dashboard/API run fine on macOS for development; only the three live data
+> sources (GPU/NVML, GPU hardware/`nvidia-smi`, and log capture/`journalctl`)
+> are Linux+NVIDIA-only and degrade to empty data instead of erroring.
 
 ## Requirements
 
