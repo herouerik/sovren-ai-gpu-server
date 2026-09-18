@@ -148,7 +148,10 @@ unified 6-GPU pool, with `public_port` pointed at a reverse proxy that blocks
 `DELETE` and forwards everything else through. The proxy itself is
 infrastructure you own separately — this tool doesn't ship or require one,
 it just distinguishes `port` (Ollama's real bind) from `public_port` (what
-clients actually connect to) so collectors watch the right one):
+clients actually connect to) so collectors watch the right one. A worked
+example of that proxy tier — DELETE-guard, rate limiting, and the mirror
+this app needs for Prompt insight below — is in `deploy/`, see
+[Prompt insight](#prompt-insight)):
 
 ```yaml
 ollama:
@@ -264,32 +267,20 @@ anything, so nothing is ever stored.
 **How to turn it on** — add an nginx `mirror` directive to whatever already
 proxies to Ollama. This sends a non-blocking *copy* of each request; nginx
 discards the copy's response, so it never adds latency to the real request
-and never affects reliability if this app is down. Example, extending the
-DELETE-guard proxy from [Configuration](#configuration):
+and never affects reliability if this app is down.
 
-```nginx
-server {
-    listen 11434;
-
-    location / {
-        if ($request_method = DELETE) { return 403 "deletes disabled on this endpoint\n"; }
-        mirror /mirror-to-monitor;
-        mirror_request_body on;
-        proxy_pass http://127.0.0.1:18434;
-        # ...existing proxy_set_header / timeout / buffering directives...
-    }
-
-    # Fire-and-forget copy, fixed target regardless of the original path --
-    # the ingestion endpoint reads the real path from X-Original-URI instead.
-    location = /mirror-to-monitor {
-        internal;
-        proxy_pass http://127.0.0.1:8082/api/prompt_mirror;
-        proxy_set_header X-Original-URI $request_uri;
-        proxy_set_header X-Service-Name "gpu-unified";  # match the service's `name` in config.yaml
-        proxy_set_header X-Real-IP $remote_addr;        # client IP shown in the Recent Prompts panel
-    }
-}
-```
+`deploy/nginx-ollama.conf.example` is a full worked example — the mirror
+block this feature needs, plus the DELETE-guard and per-path rate limit
+this fleet actually runs in front of Ollama (see the comments in that file
+for why each piece is there; the mirror is required for this feature, the
+rest is hardening you may or may not want). `deploy/conf.d-rate-limits.conf.example`
+is its companion (`limit_req_zone` has to live outside the `server {}`
+block). Both are `.example` files, not active config — copy them into your
+own nginx tree, replace `127.0.0.1:18434` and `127.0.0.1:8082` if your
+Ollama/monitor bind elsewhere, and adjust `X-Service-Name` to match a
+`name` in this app's `config.yaml`. If you only want the mirror and
+nothing else, everything below the two `if ($request_method = DELETE)`
+blocks and the `limit_req` lines is optional.
 
 Then `sudo nginx -t && sudo systemctl reload nginx`, and set
 `prompt_insight.enabled: true` in `config.yaml` (requires restarting this

@@ -1,0 +1,87 @@
+# Reverse-proxy tier this project's own GPU server runs in front of Ollama,
+# on the public port (11434) that clients actually talk to. Two things
+# bundled together here, for different reasons:
+#
+#   1. Mirror to the monitor (REQUIRED for the "Recent Prompts" dashboard
+#      panel -- see README "Prompt insight"). The monitor has no other way
+#      to see request content; Ollama's own logs never contain it at any
+#      verbosity. `mirror` sends a non-blocking *copy* of each request;
+#      nginx discards the copy's response, so it never adds latency to the
+#      real request and never affects reliability if the monitor is down.
+#
+#   2. DELETE-guard + per-path rate limit (hardening, not required for the
+#      monitor itself to function -- include it because exposing Ollama's
+#      admin surface with neither is a real footgun, not because this app
+#      needs it). `DELETE /api/delete` removes a model outright; there's no
+#      confirmation step, and no auth in front of it beyond whatever this
+#      tier adds. The rate limit exists because a misbehaving client sending
+#      an identical "hello" prompt every 1-2s with no backoff will fill a
+#      single-slot queue (OLLAMA_NUM_PARALLEL=1) and starve real requests --
+#      observed directly on this fleet, see the rate-limits.conf companion
+#      file below.
+#
+# Adjust the upstream port (18434 here -- real Ollama moved off 11434 so
+# this proxy could take it), the mirror target port (8082, this monitor's
+# default), and X-Service-Name (must match a `name` in this app's
+# config.yaml `ollama.services`) for your own setup.
+#
+# Install: copy to /etc/nginx/sites-available/, symlink into sites-enabled/,
+# also install conf.d-rate-limits.conf.example (see below), then
+# `sudo nginx -t && sudo systemctl reload nginx`.
+
+server {
+    listen 11434;
+    listen [::]:11434;
+
+    # Rate-limited specifically because this path is the one that has seen
+    # health-check/probe loops in practice. /api/generate and everything
+    # else remain unlimited below -- a blanket per-IP limit would also
+    # throttle legitimate concurrent inference from the same caller.
+    location = /v1/chat/completions {
+        if ($request_method = DELETE) {
+            return 403 "deletes disabled on this endpoint\n";
+        }
+        limit_req zone=chat_completions burst=3 nodelay;
+        limit_req_status 429;
+        mirror /mirror-to-monitor;
+        mirror_request_body on;
+        proxy_pass http://127.0.0.1:18434;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+        client_max_body_size 0;
+    }
+
+    location / {
+        if ($request_method = DELETE) {
+            return 403 "deletes disabled on this endpoint\n";
+        }
+        mirror /mirror-to-monitor;
+        mirror_request_body on;
+        proxy_pass http://127.0.0.1:18434;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+        client_max_body_size 0;
+    }
+
+    # Fire-and-forget copy for the "Recent Prompts" dashboard panel.
+    # X-Real-IP here (not just on the two blocks above) is what lets that
+    # panel attribute a prompt to its real source -- $remote_addr is always
+    # the original client's address, even inside this internal subrequest.
+    location = /mirror-to-monitor {
+        internal;
+        proxy_pass http://127.0.0.1:8082/api/prompt_mirror;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Service-Name "gpu-unified";
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}

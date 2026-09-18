@@ -1,0 +1,15 @@
+# Companion to nginx-ollama.conf.example's `limit_req zone=chat_completions`
+# reference -- nginx requires the zone to be defined at the `http {}` level
+# (conf.d/*.conf is included there in most distro packagings), not inside
+# the `server {}` block that uses it.
+#
+# rate=6r/m allows one request roughly every 10s sustained, with a burst of
+# 3 (see the `burst=3 nodelay` on the location block) absorbing a short
+# cluster of legitimate near-simultaneous requests before throttling kicks
+# in. Tune to your own traffic shape -- this was picked to stop a
+# once-per-1-2s automated probe loop without punishing normal usage, not
+# derived from any hard constraint.
+#
+# Install: copy to /etc/nginx/conf.d/, then `sudo nginx -t && sudo systemctl
+# reload nginx` (same reload as nginx-ollama.conf.example).
+limit_req_zone $binary_remote_addr zone=chat_completions:10m rate=6r/m;
