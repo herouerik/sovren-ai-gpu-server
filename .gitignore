@@ -14,3 +14,11 @@ data/
 *.db-wal
 .env
 .venv/
+
+# Real per-machine operational config -- describes *this* box's actual
+# topology (service names, ports, models). Was committed directly until
+# it became clear every machine running this needs a different one (GPU
+# server vs. a laptop doing dashboard dev). config.yaml.example is the
+# checked-in template; copy it to config.yaml and edit for your own box
+# (see README Quick Start / Configuration).
+config.yaml

@@ -86,6 +86,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
+# config.yaml is this box's own real topology and is gitignored -- copy
+# the checked-in template and edit it for your machine (see Configuration)
+cp config.yaml.example config.yaml
+
 # static/ and data/ aren't committed but are required at startup
 mkdir -p static data
 
@@ -143,15 +147,29 @@ letting that surface as a confusing 500 later.
 
 ## Configuration
 
-`config.yaml` (committed, describes this box's actual current topology — one
-unified 6-GPU pool, with `public_port` pointed at a reverse proxy that blocks
-`DELETE` and forwards everything else through. The proxy itself is
-infrastructure you own separately — this tool doesn't ship or require one,
-it just distinguishes `port` (Ollama's real bind) from `public_port` (what
-clients actually connect to) so collectors watch the right one. A worked
-example of that proxy tier — DELETE-guard, rate limiting, and the mirror
-this app needs for Prompt insight below — is in `deploy/`, see
-[Prompt insight](#prompt-insight)):
+`config.yaml` is gitignored — it describes one specific box's actual current
+topology (which differs per machine: the real GPU server vs. a laptop doing
+dashboard dev, say), so it can't be a single committed file shared by every
+checkout. `config.yaml.example` is the committed template; copy it to
+`config.yaml` and edit the copy for your own box (see [Quick
+Start](#quick-start)). The example below matches this project's own GPU
+server: one unified 6-GPU pool, with `public_port` pointed at a reverse
+proxy that blocks `DELETE` and forwards everything else through. The proxy
+itself is infrastructure you own separately — this tool doesn't ship or
+require one, it just distinguishes `port` (Ollama's real bind) from
+`public_port` (what clients actually connect to) so collectors watch the
+right one. A worked example of that proxy tier — DELETE-guard, rate
+limiting, and the mirror this app needs for Prompt insight below — is in
+`deploy/`, see [Prompt insight](#prompt-insight)):
+
+> **Upgrading an existing checkout** (e.g. the GPU server itself): before
+> pulling this change, back up your real `config.yaml`
+> (`cp config.yaml config.yaml.bak`) — it used to be a tracked file, so a
+> plain `git pull` on an unmodified working tree will delete it outright
+> once it's removed from tracking upstream (`git` applies the upstream
+> "file removed" diff to your identical local copy). After pulling, if
+> `config.yaml` is gone, just restore it: `cp config.yaml.bak config.yaml`
+> (it's gitignored now, so this won't happen again).
 
 ```yaml
 ollama:
