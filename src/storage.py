@@ -232,7 +232,17 @@ def _init_schema(db: sqlite3.Connection):
             ttft_ms REAL,
             prefill_tps REAL,
             decode_tps REAL,
-            client_ip TEXT
+            client_ip TEXT,
+            -- Coarse completion status, for platforms with no journald
+            -- (see AccessLogTailer / storage.attach_prompt_status()) --
+            -- 'pending' | 'completed' | 'failed'. Distinct from the
+            -- ttft_ms/decode_tps columns above: those come from journald
+            -- and carry real per-task timing; this only ever knows
+            -- "did the real request eventually return, and with what
+            -- HTTP status" from a reverse proxy's own access log.
+            status TEXT DEFAULT 'pending',
+            status_detail TEXT,
+            latency_ms REAL
         );
 
         CREATE INDEX IF NOT EXISTS idx_prompt_summaries_timestamp ON prompt_summaries(timestamp);
@@ -265,6 +275,12 @@ def _migrate_schema(db: sqlite3.Connection):
             db.execute(f"ALTER TABLE prompt_summaries ADD COLUMN {col} {coltype}")
     if "client_ip" not in prompt_cols:
         db.execute("ALTER TABLE prompt_summaries ADD COLUMN client_ip TEXT")
+    if "status" not in prompt_cols:
+        db.execute("ALTER TABLE prompt_summaries ADD COLUMN status TEXT DEFAULT 'pending'")
+    if "status_detail" not in prompt_cols:
+        db.execute("ALTER TABLE prompt_summaries ADD COLUMN status_detail TEXT")
+    if "latency_ms" not in prompt_cols:
+        db.execute("ALTER TABLE prompt_summaries ADD COLUMN latency_ms REAL")
     db.commit()
 
 
@@ -382,6 +398,30 @@ def attach_prompt_metrics(service_name: str, completed_at: float, metrics: Dict[
     db.execute(
         f"UPDATE prompt_summaries SET {set_cols} WHERE id = ? AND timestamp = ?",
         (*metrics.values(), row["id"], row["timestamp"]),
+    )
+    db.commit()
+
+
+def attach_prompt_status(service_name: str, completed_at: float, status: str, status_detail: Optional[str] = None) -> None:
+    """Same best-effort correlation as attach_prompt_metrics() (most recent
+    still-pending row for this service), sourced from a reverse proxy's own
+    access log instead of journald -- see AccessLogTailer. Matches on
+    `status = 'pending'` rather than `ttft_ms IS NULL`, since on a platform
+    with no journald ttft_ms can never be attached at all; without its own
+    match column this would just keep re-matching the same already-settled
+    row forever."""
+    db = get_db()
+    row = db.execute("""
+        SELECT id, timestamp FROM prompt_summaries
+        WHERE service_name = ? AND status = 'pending' AND timestamp <= ?
+        ORDER BY timestamp DESC LIMIT 1
+    """, (service_name, completed_at)).fetchone()
+    if row is None:
+        return
+    latency_ms = (completed_at - row["timestamp"]) * 1000
+    db.execute(
+        "UPDATE prompt_summaries SET status = ?, status_detail = ?, latency_ms = ? WHERE id = ? AND timestamp = ?",
+        (status, status_detail, latency_ms, row["id"], row["timestamp"]),
     )
     db.commit()
 

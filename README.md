@@ -329,6 +329,21 @@ correlation by timing: reliable (not a guess) for any service running
 `OLLAMA_NUM_PARALLEL=1`, since exactly one request is ever in flight at a
 time. Shows "pending…" until that arrives.
 
+**No journald at all (e.g. macOS)** — `ttft_ms`/`decode_tps` can never be
+attached this way, since they're parsed from journald's own slot-timing
+lines; every real prompt would show "pending…" forever with no way to tell
+a genuinely still-in-flight request from one that already succeeded or
+failed. Setting a service's `access_log_path` (in `config.yaml`) to your
+reverse proxy's own access log file gives a coarser but platform-agnostic
+fallback: `AccessLogTailer` (`src/collectors.py`) tails that file directly
+(no journald needed) and, on each completed `POST` to an inference
+endpoint, best-effort correlates it the same way (`storage.
+attach_prompt_status()`) to set `status` (`pending` / `completed` /
+`failed`) and `latency_ms` on the Recent Prompts row. No token counts or
+TTFT breakdown — just whether the real request eventually returned, and
+with what HTTP status (nginx's own `499` for a client that gave up before
+Ollama responded, e.g.). Unset (the default): this feature is simply off.
+
 **Privacy** — `data/monitor.db` only ever stores the derived summary
 (bounded by `fallback_max_chars`), never the raw prompt or response body.
 This matters because inference traffic through a coding-agent pool can

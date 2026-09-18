@@ -408,6 +408,77 @@ class LogTailer:
         }
 
 
+@dataclass
+class AccessLogEntry:
+    timestamp: float
+    method: str
+    path: str
+    status: int
+    client_ip: str
+
+
+class AccessLogTailer:
+    """Tails a reverse proxy's own access log file for real request
+    completion status -- the fallback signal on platforms with no journald
+    (e.g. macOS), where LogTailer's journalctl-based GIN parsing can never
+    run at all. Same structural ceiling as a GIN line: status/method/path/
+    client_ip/completion time only, no token counts, no TTFT (see
+    LogTailer.extract_request_info's own note on this).
+
+    Reads nginx's default combined log format. Tracks a byte offset per
+    file rather than journald's time-window approach, since this is a
+    plain local file -- a true incremental tail, immune to the same-second
+    duplicate-line issue journalctl --since has.
+    """
+
+    def __init__(self):
+        self._offsets: Dict[str, int] = {}
+
+    _RE_LINE = re.compile(
+        r'^\S+ \S+ \S+ \[(?P<time>[^\]]+)\] '
+        r'"(?P<method>\S+) (?P<path>\S+) \S+" (?P<status>\d{3}) \d+'
+    )
+
+    async def tail_new_lines(self, log_path: str) -> List[AccessLogEntry]:
+        path = Path(log_path)
+        if not path.exists():
+            return []
+        offset = self._offsets.get(log_path, 0)
+        entries: List[AccessLogEntry] = []
+        try:
+            size = path.stat().st_size
+            if size < offset:
+                offset = 0  # rotated/truncated out from under us -- restart from the top
+            with path.open("r", errors="ignore") as f:
+                f.seek(offset)
+                for line in f:
+                    entry = self._parse_line(line)
+                    if entry:
+                        entries.append(entry)
+                self._offsets[log_path] = f.tell()
+        except Exception as e:
+            print(f"Access log tail error for {log_path}: {e}")
+        return entries
+
+    def _parse_line(self, line: str) -> Optional[AccessLogEntry]:
+        m = self._RE_LINE.match(line)
+        if not m:
+            return None
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(m.group("time"), "%d/%b/%Y:%H:%M:%S %z")
+        except ValueError:
+            return None
+        client_ip = line.split(" ", 1)[0]
+        return AccessLogEntry(
+            timestamp=dt.timestamp(),
+            method=m.group("method"),
+            path=m.group("path"),
+            status=int(m.group("status")),
+            client_ip=client_ip,
+        )
+
+
 class ConnectionsCollector:
     """Samples established connections to each service's public port via `ss`.
 

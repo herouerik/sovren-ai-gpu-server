@@ -67,10 +67,10 @@ import httpx
 from src.config import settings
 from src.storage import (
     get_db, execute, query_all, query_one, ring_insert, upgrade_ring_row,
-    attach_prompt_metrics, cache_raw_prompt, get_raw_prompt,
+    attach_prompt_metrics, attach_prompt_status, cache_raw_prompt, get_raw_prompt,
     latest_gpu_samples, query_gpu_samples, resident_model,
 )
-from src.collectors import GPUCollector, OllamaStateCollector, LogTailer, ConnectionsCollector, GPUHardwareCollector
+from src.collectors import GPUCollector, OllamaStateCollector, LogTailer, AccessLogTailer, ConnectionsCollector, GPUHardwareCollector
 from src.lifecycle import get_tracker
 from src.patterns import analyze_and_store
 
@@ -78,6 +78,7 @@ from src.patterns import analyze_and_store
 gpu_collector: GPUCollector = GPUCollector()
 ollama_state_collector: OllamaStateCollector = OllamaStateCollector()
 log_tailer: LogTailer = LogTailer()
+access_log_tailer: AccessLogTailer = AccessLogTailer()
 connections_collector: ConnectionsCollector = ConnectionsCollector()
 gpu_hardware_collector: GPUHardwareCollector = GPUHardwareCollector()
 ws_connections: List[WebSocket] = []
@@ -165,9 +166,15 @@ async def collector_orchestrator():
         await asyncio.sleep(settings.collectors.gpu_poll_interval_seconds)
 
 
+_INFERENCE_ENDPOINT_SUFFIXES = ("/api/generate", "/api/chat", "/v1/chat/completions")
+
+
 async def log_capture_orchestrator():
     """Captures ollama logs: access-log requests, load-cycle lifecycle
-    events, and per-task slot timing, from the same journald tail."""
+    events, and per-task slot timing, from the same journald tail. Also
+    tails each service's own reverse-proxy access log file, if configured
+    (`access_log_path`) -- the only completion signal available at all on a
+    platform with no journald (see AccessLogTailer)."""
     tracker = get_tracker()
     # entry.service_name is the actual systemd unit; map it back to the
     # config's public_port for lifecycle connection snapshots.
@@ -175,8 +182,19 @@ async def log_capture_orchestrator():
         (svc.systemd_service or f"ollama-{svc.name}.service"): svc
         for svc in settings.get_ollama_services()
     }
+    access_log_services = [svc for svc in settings.get_ollama_services() if svc.access_log_path]
     while True:
         try:
+            for svc in access_log_services:
+                if not svc.enabled:
+                    continue
+                entries = await access_log_tailer.tail_new_lines(svc.access_log_path)
+                for entry in entries:
+                    if entry.method != "POST" or not entry.path.rstrip("/").endswith(_INFERENCE_ENDPOINT_SUFFIXES):
+                        continue
+                    status = "completed" if 200 <= entry.status < 400 else "failed"
+                    attach_prompt_status(svc.name, entry.timestamp, status, status_detail=f"HTTP {entry.status}")
+
             for systemd_name, svc in service_lookup.items():
                 if not svc.enabled:
                     continue
@@ -810,6 +828,36 @@ def _truncate_to_words(text: str, max_words: int, max_chars: int) -> str:
     return truncated
 
 
+_MIN_MEANINGFUL_PROMPT_CHARS = 15
+
+
+def _message_text(message: Dict[str, Any]) -> Optional[str]:
+    """`content` is usually a plain string, but some clients send the
+    newer content-block list shape instead: [{"type": "text", "text":
+    "..."}, ...]. Flatten either form to plain text.
+
+    An assistant turn that's calling a tool often has empty/null `content`
+    entirely -- the actual signal is in `tool_calls` instead (name +
+    arguments). Falls back to that so an agent-loop turn like "run pytest
+    on tests/foo.py" doesn't just disappear as empty."""
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+        text = "\n".join(p for p in parts if p)
+        if text:
+            return text
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        parts = []
+        for tc in tool_calls:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            parts.append(f"{fn.get('name', '?')}({fn.get('arguments', '')})")
+        return "tool_call: " + ", ".join(parts)
+    return None
+
+
 def _extract_prompt_text(endpoint: str, body: Dict[str, Any]) -> Optional[str]:
     if endpoint.endswith("/api/generate"):
         return body.get("prompt")
@@ -818,11 +866,36 @@ def _extract_prompt_text(endpoint: str, body: Dict[str, Any]) -> Optional[str]:
     # same extraction either way.
     if endpoint.endswith("/api/chat") or endpoint.endswith("/v1/chat/completions"):
         messages = body.get("messages") or []
+        # ONE reverse-chronological pass across every role -- recency has
+        # to mean position in the array, not "role, then recency within
+        # that role." An earlier version scanned all of history for any
+        # substantial user-role message first, only falling back to
+        # tool/assistant content if none existed anywhere -- which meant a
+        # single old one-off "user" turn (e.g. a coordinator prompt) would
+        # keep winning forever over every genuinely newer tool-call/
+        # assistant turn after it, since that first pass never stopped to
+        # compare positions. A client that resends full history every turn
+        # (opencode among them) can also have its most recent turns be
+        # bare continuation markers ("resume", "continue", ...) with no
+        # further human input at all -- what's actually varying call to
+        # call is the agent's own tool calls/results, already sitting in
+        # this same already-mirrored array as non-"user" roles.
+        fallback_text, fallback_role = None, None
         for m in reversed(messages):
-            if m.get("role") == "user" and m.get("content"):
-                return m["content"]
-        if messages:
-            return messages[-1].get("content")
+            role = m.get("role")
+            text = _message_text(m)
+            if not text:
+                continue
+            if fallback_text is None:
+                fallback_text, fallback_role = text, role
+            if len(text.strip()) >= _MIN_MEANINGFUL_PROMPT_CHARS:
+                return text if role == "user" else f"[{role}] {text}"
+
+        if fallback_text is None:
+            return None
+        # Last resort: even the newest message was short (e.g. a genuinely
+        # brief prompt, or a bare "resume") -- still better than nothing.
+        return fallback_text if fallback_role == "user" else f"[{fallback_role}] {fallback_text}"
     return None
 
 
@@ -930,6 +1003,7 @@ async def prompt_mirror(request: Request):
         "summary": _truncate_to_words(prompt_text, cfg.fallback_max_words, cfg.fallback_max_chars),
         "source": "truncated",
         "client_ip": client_ip,
+        "status": "pending",
     }, capacity=cfg.ring_capacity)
     cache_raw_prompt(row_id, timestamp, prompt_text)
 

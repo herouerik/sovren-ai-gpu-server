@@ -22,6 +22,12 @@ class OllamaServiceConfig(BaseSettings):
     # a future purpose, never started) shouldn't be reported as "unhealthy"
     # just because nothing answers on their port.
     enabled: bool = True
+    # Optional fallback completion signal for platforms with no journald
+    # (e.g. macOS): path to the reverse proxy's own access log file. Tells
+    # you only whether a mirrored prompt's real request eventually finished
+    # or failed, not token counts/TTFT (see AccessLogTailer). Unset means
+    # this feature is simply off -- nothing tails anything.
+    access_log_path: Optional[str] = None
 
     model_config = SettingsConfigDict(extra="allow")
 
