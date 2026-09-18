@@ -1,18 +1,26 @@
 ollama:
   services:
-    - name: "gpu-unified"
-      port: 18434
-      public_port: 11434
-      gpu_ids: [1, 2, 3, 4, 5, 6]
-      model: "qwen3-coder-next:Q4_K_M"
-      description: "Unified 6x P100 pool — Ollama bound internally on `port`; `public_port` is what LAN clients connect to. Example assumes a reverse proxy sits in front (nginx, Caddy, a firewall rule, etc.) rejecting destructive methods like DELETE and forwarding everything else — this tool doesn't require one, but if you have one, point public_port at it."
-      systemd_service: "ollama-unified.service"
-    - name: "meta"
+    # One entry per Ollama instance this monitor should watch. `port` is
+    # Ollama's real bind; `public_port` is what clients actually connect to
+    # if you run a reverse proxy in front of it (see README "Configuration"
+    # and deploy/nginx-ollama.conf.example) -- omit public_port if you
+    # don't, and collectors will just watch `port` directly.
+    - name: "primary"
+      port: 11500                  # Ollama's real (internal-only) bind
+      public_port: 11434           # what clients actually connect to, via a reverse proxy
+      gpu_ids: [0, 1]              # GPU indices (nvidia-smi order) that belong to this pool
+      model: "<model-tag-here>"    # must match what's actually loaded, e.g. "llama3.1:70b"
+      description: "Example primary inference pool."
+      systemd_service: "ollama.service"
+    - name: "secondary"
       port: 11435
-      gpu_ids: [0]
-      model: "qwen2.5-coder:7b"
-      description: "GPU 0 (RTX 2080 Ti) meta pool — dedicated to prompt_insight.summarizer_service (see README \"Prompt insight\"), started 2026-09-11. Not customer-facing inference; kept isolated from the main pool (OLLAMA_VULKAN=false) specifically so it never competes with it."
-      systemd_service: "ollama-meta.service"
+      gpu_ids: [2]
+      model: "<smaller-model-tag-here>"
+      # A second, smaller pool is optional -- useful for isolating a task
+      # that would otherwise compete with primary inference for capacity,
+      # e.g. prompt_insight.summarizer_service below.
+      description: "Example secondary pool, kept isolated from primary."
+      systemd_service: "ollama-secondary.service"
       enabled: true
 
 collectors:
@@ -45,8 +53,6 @@ patterns:
     - "429"
   cpu_spillover_threshold_percent: 80
   baseline_window_minutes: 10
-  # New thresholds, added for the failure modes actually diagnosed on this
-  # box (reload storms, connection pileups, near-zero keep_alive, ctx churn).
   reload_storm_count_threshold: 5
   reload_storm_window_seconds: 300
   ctx_churn_distinct_values_threshold: 2
@@ -68,13 +74,14 @@ server:
 # snippet. Off by default; harmless to leave on with no mirror configured
 # (nothing ever arrives, so nothing is stored).
 prompt_insight:
-  enabled: true
+  enabled: false
   # Name of an entry in ollama.services to ask for a real summary instead
-  # of mechanical truncation -- "meta" here is this box's otherwise-idle
-  # GPU 0, dedicated to this so it never competes with real inference.
-  # Not running or not configured: every prompt just falls back to
-  # mechanical truncation, silently, no error.
-  summarizer_service: "meta"
+  # of mechanical truncation -- point this at hardware that isn't part of
+  # your real inference pool if you have any, so summarization never
+  # competes with real inference for capacity. Not running or not
+  # configured: every prompt just falls back to mechanical truncation,
+  # silently, no error.
+  summarizer_service: "secondary"
   summarizer_timeout_seconds: 20
   fallback_max_words: 40
   fallback_max_chars: 200
