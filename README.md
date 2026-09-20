@@ -155,12 +155,13 @@ checkout. `config.yaml.example` is the committed template; copy it to
 Start](#quick-start)). The example below matches this project's own GPU
 server: one unified 6-GPU pool, with `public_port` pointed at a reverse
 proxy that blocks `DELETE` and forwards everything else through. The proxy
-itself is infrastructure you own separately — this tool doesn't ship or
-require one, it just distinguishes `port` (Ollama's real bind) from
+itself is infrastructure you own separately — this tool doesn't ship one
+running by default, it just distinguishes `port` (Ollama's real bind) from
 `public_port` (what clients actually connect to) so collectors watch the
-right one. A worked example of that proxy tier — DELETE-guard, rate
-limiting, and the mirror this app needs for Prompt insight below — is in
-`deploy/`, see [Prompt insight](#prompt-insight)):
+right one. Worked examples of that proxy tier — DELETE-guard, rate
+limiting, and the mirror this app needs for Prompt insight below, for both
+Linux (the GPU server's own setup) and macOS — are in `deploy/`, see
+[Prompt insight](#prompt-insight)):
 
 > **Upgrading an existing checkout** (e.g. the GPU server itself): before
 > pulling this change, back up your real `config.yaml`
@@ -303,6 +304,14 @@ blocks and the `limit_req` lines is optional.
 Then `sudo nginx -t && sudo systemctl reload nginx`, and set
 `prompt_insight.enabled: true` in `config.yaml` (requires restarting this
 app — YAML config is only read at startup).
+
+**On macOS** (Ollama.app, Homebrew nginx, no systemd) the mechanics differ
+enough to warrant a separate example: `deploy/nginx-ollama-macos.conf.example`
+covers moving Ollama's own bind off the port nginx needs to take over
+(`launchctl setenv OLLAMA_HOST ...` + relaunching Ollama.app), Homebrew's
+`servers/*.conf` layout instead of `sites-available`, and `brew services`
+instead of `systemctl`. Same mirror mechanism underneath; only the install
+steps and paths change.
 
 **Summarization** — every mirrored prompt gets a mechanical fallback first
 (first `fallback_max_words` words / `fallback_max_chars` chars, whichever

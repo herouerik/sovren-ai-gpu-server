@@ -1,0 +1,79 @@
+# macOS variant of nginx-ollama.conf.example -- same mirror + DELETE-guard
+# tier, but macOS's Ollama.app and Homebrew's nginx differ from the Linux
+# GPU server in three ways that change the setup steps, not just the
+# config file:
+#
+#   1. Ollama.app binds 0.0.0.0:11434 by default and there's no systemd
+#      unit to redirect -- to let nginx take over 11434 (the port your
+#      other machines/tools already call), move Ollama's own real bind
+#      first:
+#          launchctl setenv OLLAMA_HOST "127.0.0.1:11435"
+#      then quit and reopen Ollama.app (or `killall Ollama` -- it
+#      restarts cleanly) so it actually rebinds. This persists across
+#      reboots; you only do it once.
+#
+#   2. Homebrew's nginx doesn't use /etc/nginx/sites-available or
+#      systemctl. Install with `brew install nginx`, then drop this file
+#      (renamed to just end in .conf) into
+#          $(brew --prefix)/etc/nginx/servers/
+#      which is auto-included by the default nginx.conf's `include
+#      servers/*;`. Test with `nginx -t` (or `$(brew --prefix)/opt/nginx/
+#      bin/nginx -t` if it's not on PATH), then `brew services start
+#      nginx` (first time) or `brew services restart nginx` (after
+#      editing this file again). Homebrew's nginx also defaults to port
+#      8080 for its own placeholder server block -- irrelevant here since
+#      this file's `listen 11434` takes the port you actually want.
+#
+#   3. Ollama.app has no journald equivalent, so this monitor's real
+#      per-request TTFT/token metrics can never populate on macOS (see
+#      README "No journald at all"). Point a service's `access_log_path`
+#      in config.yaml at nginx's access log --
+#          $(brew --prefix)/var/log/nginx/access.log
+#      (typically /opt/homebrew/var/log/nginx/access.log on Apple
+#      Silicon, /usr/local/var/log/nginx/access.log on Intel) -- so
+#      Recent Prompts can at least show completed/failed/pending instead
+#      of "pending…" forever.
+#
+# Adjust the upstream port (11435 here -- wherever you moved Ollama's real
+# bind to in step 1), the mirror target port (8082, this monitor's
+# default), and X-Service-Name (must match a `name` in this app's
+# config.yaml `ollama.services`) for your own setup. Rate limiting is
+# left out here (unlike nginx-ollama.conf.example) -- it's aimed at
+# hardening a fleet's public-facing endpoint, not a single dev machine
+# talking to its own local Ollama; add `deploy/conf.d-rate-limits.conf.
+# example`'s zone (into servers/, same include mechanism) if you want it.
+
+server {
+    listen 11434;
+    listen [::]:11434;
+
+    location / {
+        if ($request_method = DELETE) {
+            return 403 "deletes disabled on this endpoint\n";
+        }
+        mirror /mirror-to-monitor;
+        mirror_request_body on;
+        proxy_pass http://127.0.0.1:11435;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+        client_max_body_size 0;
+    }
+
+    # Fire-and-forget copy for the "Recent Prompts" dashboard panel.
+    # X-Real-IP here (not just on the block above) is what lets that
+    # panel attribute a prompt to its real source -- $remote_addr is
+    # always the original client's address, even inside this internal
+    # subrequest.
+    location = /mirror-to-monitor {
+        internal;
+        proxy_pass http://127.0.0.1:8082/api/prompt_mirror;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Service-Name "macbook-local";
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
