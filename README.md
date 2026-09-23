@@ -467,8 +467,8 @@ upserts, one row per GPU/service. See `src/storage.py` for exact columns and the
 
 | Pattern | Detection Logic |
 |---|---|
-| **reload_storm** | N+ load cycles in a rolling window (default: 5 in 300s) |
-| **load_cancelled** | A load failed via client-side cancellation, not a crash — a caller's timeout is shorter than this model's load time |
+| **reload_storm** | N+ load cycles in a rolling window (default: 5 in 300s) — excludes fast-rejects (see below) |
+| **load_cancelled** | A load failed via client-side cancellation, not a crash — a caller's timeout is shorter than this model's load time. Excludes fast-rejects (see below): a `failed` row that resolved in under `fast_reject_max_duration_seconds` (default 15s) was never a real load attempt in the first place, so this description would be actively wrong for it |
 | **ctx_churn** | 2+ distinct `num_ctx` values requested for the same service within a window (default 900s) — forces a reload on every switch |
 | **model_churn** | 2+ distinct models requested for the same service within the same window — models fighting over one single-model-at-a-time pool. Deliberately does *not* fire for a slow, intentional model switch (e.g. a bandit comparing sovereign candidates every few hours) — a single reload event can never produce 2 distinct values on its own; only 2+ separate reloads inside the same short window do |
 | **rejected_model_mismatch** | N+ requests (default 3 in 300s) naming a model that doesn't match what's actually resident — distinct from `model_churn`, which only sees real load attempts via `load_cycles`. A caller whose `num_ctx`/model mismatch is severe enough trips Ollama's own fast-reject admission check (instant 503, no load attempt, no journald "starting llama-server" line at all) — `load_cycles`-based detection is structurally blind to this. Reads the mirrored request's own declared `model` field instead (`prompt_summaries`), so it catches rejected-before-ever-attempting-to-load traffic too — real, wasted requests fighting a single-model-at-a-time pool even though nothing ever actually reloads |
@@ -480,6 +480,19 @@ upserts, one row per GPU/service. See `src/storage.py` for exact columns and the
 | **gpu_starvation** | High VRAM, near-zero compute — informational; often just idle-but-loaded on this hardware |
 | **gpu_hardware_fault** | Pending page retirement, or any uncorrected ECC error — real hardware degradation |
 | **cpu_spillover** | System-wide CPU above threshold while all GPUs are idle — inference may be running on CPU instead of GPU |
+
+**Fast-rejects, and why `reload_storm`/`load_cancelled` exclude them**: a `load_cycles` row with
+`outcome = 'failed'` isn't always a real cold-load attempt that failed partway through. A caller
+sending a `num_ctx`/model that doesn't match what's resident can trigger a `starting` →`failed`
+pair that resolves in milliseconds-to-seconds — real hardware on this fleet has never completed a
+genuine cold load (success or failure) in under ~90s, so anything faster was never actually
+loading weights. One stale, already-fixed source of these (a misconfigured health-check probe,
+see the handover doc's Turns 70-73) can leave hundreds of these rows sitting in the 14-day
+retention window, which would otherwise make a perfectly healthy pool's Load Cycle Timeline look
+almost entirely red and could fire false `reload_storm`/`load_cancelled` alerts. Both the
+dashboard timeline (rendered as a distinct brown "fast-reject" segment, not red) and these two
+detectors exclude `failed` rows under `patterns.fast_reject_max_duration_seconds` (default 15s) —
+this is a display/detection distinction only, the underlying `load_cycles` rows are untouched.
 
 ## API Endpoints
 

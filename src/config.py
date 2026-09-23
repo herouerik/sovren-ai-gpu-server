@@ -89,6 +89,15 @@ class PatternsConfig(BaseSettings):
     # this well before load_cycles-based detection could ever catch it.
     rejected_model_mismatch_count_threshold: int = 3
     rejected_model_mismatch_window_seconds: int = 300
+    # Distinct from the instant, zero-load_cycles-row rejects above: this is
+    # a 'starting' -> 'failed' pair that DOES get a load_cycles row, but
+    # resolves in seconds rather than the ~90s+ a real cold load on this
+    # hardware has ever taken (confirmed repeatedly, e.g. a real 144.99s
+    # success and a real 178.2s failure for the unified pool's 79.7B model).
+    # A 'failed' row under this threshold was never a real weights-load
+    # attempt -- reload_storm/load_cancelled both exclude these so one old
+    # mismatched-request source can't paint a healthy pool's alerts red.
+    fast_reject_max_duration_seconds: float = 15.0
 
     model_config = SettingsConfigDict(extra="allow")
 

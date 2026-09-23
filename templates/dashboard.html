@@ -84,6 +84,7 @@ a{color:inherit}
 .timeline-seg{height:100%;min-width:3px;cursor:pointer;position:relative}
 .timeline-seg.success{background:var(--green)}
 .timeline-seg.failed{background:var(--red)}
+.timeline-seg.fast-reject{background:#8a5a2e}
 .timeline-seg.superseded{background:var(--muted)}
 .timeline-seg.pending{background:var(--yellow);animation:blink 1.2s ease-in-out infinite}
 .timeline-seg:hover::after{
@@ -205,6 +206,7 @@ canvas{max-width:100%}
       <div class="timeline-legend">
         <span><span class="legend-dot" style="background:var(--green)"></span>success</span>
         <span><span class="legend-dot" style="background:var(--red)"></span>failed / cancelled</span>
+        <span><span class="legend-dot" style="background:#8a5a2e"></span>fast-reject (mismatched request, not a real load attempt)</span>
         <span><span class="legend-dot" style="background:var(--muted)"></span>superseded</span>
         <span><span class="legend-dot" style="background:var(--yellow)"></span>loading now</span>
       </div>
@@ -382,6 +384,19 @@ function renderGauges(status) {
   }
 }
 
+// A genuine cold load on this fleet's hardware has never completed (success
+// or failure) in under ~90s -- confirmed repeatedly, e.g. a real 144.99s
+// success and a real 178.2s failure, both for the 79.7B unified-pool model.
+// A 'failed' cycle that resolved in under this threshold was never a real
+// load attempt: it's Ollama's fast admission-reject for a request whose
+// num_ctx/model doesn't match what's already resident (see the wrong-port
+// health-check-probe incident, handover Turns 70-73) -- 'starting' and
+// 'failed' fire back-to-back in milliseconds-to-seconds, not a weights-load
+// timeline. Distinguishing this in the UI matters: one old, already-fixed
+// probe bug can leave hundreds of these in the 14-day retention window,
+// which would otherwise paint an entire healthy pool's timeline red.
+const FAST_REJECT_THRESHOLD_S = 15;
+
 function renderTimeline(cycles) {
   const el = $('timeline');
   if (!cycles.length) { el.innerHTML = '<div class="timeline-empty">No load cycles recorded yet.</div>'; return; }
@@ -395,12 +410,14 @@ function renderTimeline(cycles) {
     const track = document.createElement('div');
     track.className = 'timeline-track';
     for (const c of list.slice(-50)) {
+      const isFastReject = c.outcome === 'failed' && c.duration_s != null && c.duration_s < FAST_REJECT_THRESHOLD_S;
       const seg = document.createElement('div');
-      seg.className = 'timeline-seg ' + c.outcome;
+      seg.className = 'timeline-seg ' + (isFastReject ? 'fast-reject' : c.outcome);
       seg.style.flex = '1';
       const dur = c.duration_s != null ? c.duration_s.toFixed(0) + 's' : 'in progress';
+      const label = isFastReject ? 'fast-reject (mismatched ctx/model, not a real load attempt)' : c.outcome;
       seg.setAttribute('data-tip',
-        `${new Date(c.start_ts*1000).toLocaleTimeString()} · ctx=${c.ctx_requested ?? '?'} · ${c.outcome} · ${dur}` +
+        `${new Date(c.start_ts*1000).toLocaleTimeString()} · ctx=${c.ctx_requested ?? '?'} · ${label} · ${dur}` +
         (c.triggering_client_ip ? ` · from ${c.triggering_client_ip}` : ''));
       track.appendChild(seg);
     }

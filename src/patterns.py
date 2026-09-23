@@ -64,10 +64,14 @@ class PatternAnalyzer:
         window = settings.patterns.reload_storm_window_seconds
         cutoff = time.time() - window
 
+        fast_reject_max = settings.patterns.fast_reject_max_duration_seconds
         rows = execute("""
             SELECT service_name, COUNT(*) as c, MIN(id) as first_id, MAX(id) as last_id
-            FROM load_cycles WHERE start_ts > ? GROUP BY service_name
-        """, (cutoff,)).fetchall()
+            FROM load_cycles
+            WHERE start_ts > ?
+              AND NOT (outcome = 'failed' AND duration_s IS NOT NULL AND duration_s < ?)
+            GROUP BY service_name
+        """, (cutoff, fast_reject_max)).fetchall()
 
         patterns = []
         for row in rows:
@@ -88,11 +92,13 @@ class PatternAnalyzer:
         crash — distinguishes "someone's timeout is shorter than this
         model's load time" from a real hardware/OOM failure."""
         cutoff = time.time() - 300
+        fast_reject_max = settings.patterns.fast_reject_max_duration_seconds
         rows = execute("""
             SELECT id, service_name, model, ctx_requested, duration_s, timestamp
             FROM (SELECT *, start_ts as timestamp FROM load_cycles)
             WHERE outcome = 'failed' AND failed_ts > ?
-        """, (cutoff,)).fetchall()
+              AND (duration_s IS NULL OR duration_s >= ?)
+        """, (cutoff, fast_reject_max)).fetchall()
 
         patterns = []
         for row in rows:

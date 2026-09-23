@@ -61,6 +61,7 @@ patterns:
   connection_pileup_threshold: 6
   rejected_model_mismatch_count_threshold: 3
   rejected_model_mismatch_window_seconds: 300
+  fast_reject_max_duration_seconds: 15.0
 
 server:
   host: "0.0.0.0"
