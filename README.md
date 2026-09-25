@@ -372,6 +372,75 @@ to "only the summary is ever kept" — worth knowing if you're deploying
 this somewhere the process's own memory needs to be trusted, not just the
 database file.
 
+## Watchdog
+
+Off by default (`watchdog.enabled: false`) — this is the one feature in
+this app that takes a real production action (`systemctl restart`) instead
+of only observing. Built from a real incident: a request was mid-generation,
+healthy, actively decoding tokens -- then a GPU hit a PCIe Uncorrectable
+(Non-Fatal) error mid-CUDA-op, and llama-server went silent instantly. No
+crash, no error surfaced anywhere in its own logs, no further progress
+ever — just the process pegged near 100% CPU and every subsequent request
+admitted then aborted, for hours, until a human happened to notice.
+
+**Detection** (`src/watchdog.py`): a service counts as wedged when real
+inference traffic arrived (a `POST` to `/api/generate`, `/api/chat`, or
+`/v1/chat/completions`) but llama-server logged **zero** real progress — not
+even a slow prefill/decode tick — for the entire `wedge_window_seconds`
+(default 1200s/20min). "Progress" means a `slot print_timing` or `slot
+launch_slot_` journald line (`LogTailer.is_progress_line()`), tracked
+per-service in `service_activity.last_progress_ts`. This deliberately does
+**not** treat a `200` response in the `requests` table as proof of health —
+an early version did, and replaying it against this box's own keepwarm
+cron (an empty-prompt keep_alive touch every 5 minutes, always `200` in
+~230ms, zero real inference) showed that would mask a genuine wedge
+forever, since keepwarm guarantees a `200` on a fixed cadence regardless of
+whether real generation works at all. `last_progress_ts` is immune to this:
+a bodyless keep-alive touch never produces a `print_timing`/`launch_slot_`
+line.
+
+This same signal is also what tells a genuine wedge apart from this
+fleet's other real incident (an oversized accumulated context + a client
+timeout shorter than this hardware's real prefill throughput — looked
+identical from the outside, but was real work, just slow). That incident
+logged progress every ~10-15s for its whole multi-minute duration and
+eventually completed; a genuine wedge logs nothing, for the entire window,
+no matter how long you wait.
+
+**Remediation**: `sudo -n systemctl restart <systemd_service>` for the
+wedged service. `-n` (non-interactive) fails fast with a clear message if
+the sudoers grant below isn't set up, instead of hanging on a password
+prompt nothing can ever answer. Every attempt — whether it actually ran,
+or was suppressed — is logged to `watchdog_actions` (`GET
+/api/watchdog_actions`, and the dashboard's "Watchdog Actions" panel), so
+it's always auditable why a service did or didn't get restarted.
+
+**Safety knobs**, both needed because a restart is a real, consequential
+action:
+- `restart_cooldown_seconds` (default 1200) — won't attempt another
+  restart for the same service within this long of the last attempt, so a
+  restart gets time to actually take effect (cold load + some real
+  traffic) before being re-judged.
+- `max_restarts_per_day` (default 3) — hard ceiling regardless of
+  cooldown. If a service wedges this many times in a rolling 24h,
+  something a restart doesn't fix is going on (failing hardware, not a
+  transient hang) — this stops trying and raises a `service_wedged`
+  pattern for a human instead of restart-looping forever.
+
+**Required sudoers grant** — scoped to exactly the restart command(s) this
+needs, nothing broader:
+```bash
+sudo visudo -f /etc/sudoers.d/gpu-server-watchdog
+```
+```
+<user> ALL=(root) NOPASSWD: /usr/bin/systemctl restart ollama-unified.service, /usr/bin/systemctl restart ollama-meta.service
+```
+Replace `<user>` with whatever user runs this app, and the two unit names
+with your own services' `systemd_service` values. Without this grant, every
+restart attempt fails cleanly (logged to `watchdog_actions` as `failed`,
+detail `sudo: a password is required`) rather than hanging — the watchdog
+still detects and alerts, it just can't act.
+
 ## Data Schema
 
 ### load_cycles table (the real health signal)
@@ -480,6 +549,7 @@ upserts, one row per GPU/service. See `src/storage.py` for exact columns and the
 | **gpu_starvation** | High VRAM, near-zero compute — informational; often just idle-but-loaded on this hardware |
 | **gpu_hardware_fault** | Pending page retirement, or any uncorrected ECC error — real hardware degradation |
 | **cpu_spillover** | System-wide CPU above threshold while all GPUs are idle — inference may be running on CPU instead of GPU |
+| **service_wedged** | Real traffic arrived but llama-server logged zero progress for the whole detection window — see [Watchdog](#watchdog). Only emitted when `watchdog.enabled: true` |
 
 **Fast-rejects, and why `reload_storm`/`load_cancelled` exclude them**: a `load_cycles` row with
 `outcome = 'failed'` isn't always a real cold-load attempt that failed partway through. A caller
@@ -513,6 +583,7 @@ this is a display/detection distinction only, the underlying `load_cycles` rows 
 | `GET /api/prompt_summaries` | Recent one-line prompt summaries (see [Prompt insight](#prompt-insight)) |
 | `GET /api/prompt_raw/{id}` | Real prompt text behind one summary, in-memory only (see [Prompt insight](#prompt-insight)) |
 | `POST /api/prompt_mirror` | Reverse-proxy mirror target — not for direct use, see [Prompt insight](#prompt-insight) |
+| `GET /api/watchdog_actions` | Full audit trail of auto-restart attempts, run or suppressed (see [Watchdog](#watchdog)) |
 | `WS /ws` | Live updates (GPU samples, connections, lifecycle events, patterns) |
 
 ## Dashboard
@@ -522,6 +593,8 @@ Open `http://localhost:8082` — single-page, health-first layout:
 - **Hero status card** — per service: STABLE / RELOADING / DEGRADED / IDLE, resident
   model, context size, loaded-since time, keep_alive countdown
 - **Load-cycle timeline** — color-coded swimlane (green=success, red=failed/cancelled,
+  brown=fast-reject — a mismatched request rejected in seconds, never a real load attempt,
+  see [Pattern Detection](#pattern-detection)'s `fast_reject_max_duration_seconds` note,
   gray=superseded, pulsing yellow=loading now), hover for exact timing/trigger
 - **GPU hardware checklist** — ECC/retired-pages per GPU, a checklist not a chart
 - **GPU compute strip** — live per-GPU utilization
@@ -534,6 +607,8 @@ Open `http://localhost:8082` — single-page, health-first layout:
   caller IP**
 - **Recent prompts** — scrollable, one-line-each summaries of the last 20 prompts
   (empty until [Prompt insight](#prompt-insight) is configured)
+- **Watchdog actions** — audit trail of auto-restart attempts, run or suppressed
+  (empty unless [Watchdog](#watchdog) is enabled)
 - **Header** — live clock plus "monitoring since" (this process's own start time,
   not the history depth of any individual table — see [Storage retention](#storage-retention)
   for what each table actually covers)

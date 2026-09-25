@@ -104,6 +104,21 @@ def _init_schema(db: sqlite3.Connection):
             status TEXT
         );
 
+        -- Latest-only, one row per service: the last time llama-server
+        -- logged ANY real inference progress (a 'print_timing' line, mid-
+        -- prefill or mid-decode, or a 'launch_slot_' task start) -- not
+        -- just a completion. This is the signal that distinguishes a
+        -- genuinely wedged server (traffic arrives, gets admitted, then
+        -- total silence -- see watchdog.py) from one that's merely slow on
+        -- a huge context (traffic arrives, progress lines keep advancing
+        -- every ~10-15s, and it eventually completes). See
+        -- src/watchdog.py module docstring for the real incident this is
+        -- built from.
+        CREATE TABLE IF NOT EXISTS service_activity (
+            service_name TEXT PRIMARY KEY,
+            last_progress_ts REAL NOT NULL
+        );
+
         -- Discrete events, retained for exactly `event_retention_days`
         -- calendar days via day-slots that wrap: day_slot = epoch_day %
         -- retention_days. Writing into today's slot evicts any stale rows
@@ -157,6 +172,26 @@ def _init_schema(db: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_load_cycles_service ON load_cycles(service_name);
         CREATE INDEX IF NOT EXISTS idx_load_cycles_outcome ON load_cycles(outcome);
         CREATE INDEX IF NOT EXISTS idx_load_cycles_day_slot ON load_cycles(day_slot);
+
+        -- Audit trail for src/watchdog.py's auto-restart action -- every
+        -- attempt, whether it actually ran `systemctl restart` or was
+        -- suppressed by cooldown/daily-cap, so an operator can always see
+        -- why (or why not) the service was restarted. Same day-slot
+        -- retention scheme as load_cycles/patterns.
+        CREATE TABLE IF NOT EXISTS watchdog_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_slot INTEGER NOT NULL,
+            epoch_day INTEGER NOT NULL,
+            timestamp REAL NOT NULL,
+            service_name TEXT NOT NULL,
+            action TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            detail TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_watchdog_actions_service ON watchdog_actions(service_name);
+        CREATE INDEX IF NOT EXISTS idx_watchdog_actions_timestamp ON watchdog_actions(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_watchdog_actions_day_slot ON watchdog_actions(day_slot);
 
         -- `connection_window_hours` sliding window at `connection_bucket_
         -- seconds` resolution. One row per (service_name, bucket_index); a
@@ -321,6 +356,27 @@ def resident_model(service_name: str) -> Optional[str]:
         return None
     models = json.loads(row["models_json"])
     return models[0]["name"] if models else None
+
+
+def record_progress(service_name: str, timestamp: float) -> None:
+    """Called whenever LogTailer sees a real llama-server progress line
+    (mid-prefill, mid-decode, or a new task starting) -- see
+    service_activity's schema comment for why this exists."""
+    db = get_db()
+    db.execute(
+        "INSERT INTO service_activity (service_name, last_progress_ts) VALUES (?, ?) "
+        "ON CONFLICT(service_name) DO UPDATE SET last_progress_ts = excluded.last_progress_ts "
+        "WHERE excluded.last_progress_ts > service_activity.last_progress_ts",
+        (service_name, timestamp),
+    )
+    db.commit()
+
+
+def last_progress_ts(service_name: str) -> Optional[float]:
+    row = query_one(
+        "SELECT last_progress_ts FROM service_activity WHERE service_name = ?", (service_name,)
+    )
+    return row["last_progress_ts"] if row else None
 
 
 def upsert(table: str, data: Dict[str, Any]) -> None:

@@ -262,6 +262,13 @@ canvas{max-width:100%}
     </thead><tbody></tbody></table></div>
   </div>
 
+  <div class="section">
+    <div class="section-head"><span class="section-title" title="Audit trail for the watchdog's auto-restart action (off by default, see README 'Watchdog'). A service is 'wedged' when real traffic arrives, none of it succeeds, and llama-server logs zero progress -- not even a slow tick -- for the whole detection window. Every attempt is logged here whether it actually restarted the service or was suppressed by cooldown/daily-cap.">Watchdog Actions</span></div>
+    <div class="section-body"><table class="data" id="watchdogTable"><thead>
+      <tr><th>When</th><th>Service</th><th>Action</th><th>Outcome</th><th>Detail</th></tr>
+    </thead><tbody></tbody></table></div>
+  </div>
+
   <div class="two-col">
     <div class="section">
       <div class="section-head"><span class="section-title" title="Aggregated over the current window: request counts, error rate, average end-to-end latency (queue + prefill + generation), and real per-task TTFT/prefill/decode throughput from llama.cpp's own timing.">Requests by Model / Service</span></div>
@@ -556,6 +563,22 @@ function renderRequestedModels(rows) {
   }).join('');
 }
 
+function renderWatchdogActions(rows) {
+  const tbody = $('watchdogTable').querySelector('tbody');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No watchdog actions -- either disabled, or nothing has ever wedged.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => `
+    <tr>
+      <td>${fmtSince(r.timestamp)}</td>
+      <td>${escHtml(r.service_name)}</td>
+      <td>${escHtml(r.action)}</td>
+      <td class="${r.outcome === 'success' ? 'hw-ok' : (r.outcome === 'failed' ? 'hw-crit' : 'hw-warn')}">${escHtml(r.outcome)}</td>
+      <td>${escHtml(r.detail || '')}</td>
+    </tr>`).join('');
+}
+
 function fmtPromptMetrics(p) {
   // Metrics arrive asynchronously, well after the row itself is created
   // (see storage.attach_prompt_metrics -- best-effort correlation by
@@ -758,7 +781,7 @@ function renderConnChart(samples) {
 
 async function refreshAll() {
   try {
-    const [status, cycles, hw, loadSeries, tasks, conns, patterns, summary, prompts, requestedModels] = await Promise.all([
+    const [status, cycles, hw, loadSeries, tasks, conns, patterns, summary, prompts, requestedModels, watchdogActions] = await Promise.all([
       getJSON('/api/health_status'),
       getJSON('/api/load_cycles?limit=200'),
       getJSON('/api/gpu_hardware'),
@@ -769,6 +792,7 @@ async function refreshAll() {
       getJSON('/api/metrics/summary?window_seconds=3600'),
       getJSON('/api/prompt_summaries?limit=100'),
       getJSON('/api/requested_models?window_seconds=3600'),
+      getJSON('/api/watchdog_actions?limit=20'),
     ]);
     renderHero(status);
     renderGauges(status);
@@ -779,6 +803,7 @@ async function refreshAll() {
     renderConnChart(conns);
     renderPatterns(patterns);
     renderRequestedModels(requestedModels);
+    renderWatchdogActions(watchdogActions);
     renderMetricsTables(summary);
     renderPrompts(prompts);
   } catch (e) {

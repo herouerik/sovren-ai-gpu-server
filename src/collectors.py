@@ -407,6 +407,17 @@ class LogTailer:
             "decode_tps": metrics.get("decode_tps"),
         }
 
+    # "slot print_timing:" covers both prefill progress ("prompt processing,
+    # n_tokens=...") and decode progress ("n_decoded=..., tg=...") -- either
+    # one is proof llama-server is actively making forward progress on a
+    # real task, not wedged. "slot launch_slot_:" catches a new task
+    # starting, in case a request hangs before its first print_timing line.
+    # Only presence + timestamp matter here -- see storage.record_progress().
+    _RE_PROGRESS = re.compile(r'slot (print_timing|launch_slot_):')
+
+    def is_progress_line(self, entry: LogEntry) -> bool:
+        return bool(self._RE_PROGRESS.search(entry.message))
+
 
 @dataclass
 class AccessLogEntry:

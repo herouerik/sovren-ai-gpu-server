@@ -102,6 +102,39 @@ class PatternsConfig(BaseSettings):
     model_config = SettingsConfigDict(extra="allow")
 
 
+class WatchdogConfig(BaseSettings):
+    # Off by default -- this is the one feature in this app that takes a
+    # real production action (systemctl restart) rather than just
+    # observing. A deployer has to opt in deliberately, and needs a
+    # sudoers NOPASSWD grant scoped to exactly the restart commands this
+    # needs (see README "Watchdog").
+    enabled: bool = False
+    # A service is "wedged" if real inference traffic arrived, none of it
+    # succeeded, AND llama-server logged zero progress (not even a slow
+    # prefill/decode tick) for this whole window. 1200s (20min) is
+    # deliberately well above this fleet's observed cold-load ceiling
+    # (~226s) and above any legitimately-slow large-context request (which
+    # logs progress every ~10-15s the whole time it's running) -- both of
+    # those clear the wedge condition on their own well within this
+    # window. Only a genuine hang (confirmed once: a GPU PCIe uncorrectable
+    # error mid-CUDA-op, see handover doc) sits silent for the full window.
+    wedge_window_seconds: int = 1200
+    min_real_requests_in_window: int = 1
+    # Don't attempt another restart for the same service within this many
+    # seconds of the last one -- gives a restart time to actually take
+    # effect (cold load + some real traffic) before re-evaluating, and
+    # caps the blast radius if restarting doesn't actually fix whatever's
+    # wrong.
+    restart_cooldown_seconds: int = 1200
+    # Hard ceiling regardless of cooldown -- if a service wedges this many
+    # times in a rolling 24h, something restarts don't fix is going on
+    # (bad hardware, not a transient hang) and this stops trying and
+    # raises a pattern for a human instead of restart-looping forever.
+    max_restarts_per_day: int = 3
+
+    model_config = SettingsConfigDict(extra="allow")
+
+
 class PromptInsightConfig(BaseSettings):
     # Off by default: requires a reverse proxy mirroring requests to
     # /api/prompt_mirror (see README "Prompt insight") -- without that
@@ -147,6 +180,7 @@ class Settings(BaseSettings):
     patterns: PatternsConfig = Field(default_factory=PatternsConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     prompt_insight: PromptInsightConfig = Field(default_factory=PromptInsightConfig)
+    watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
 
     model_config = SettingsConfigDict(extra="allow")
 

@@ -68,6 +68,18 @@ server:
   port: 8082
   cors_origins: ["*"]
 
+# Off by default -- this is the one feature in this app that takes a real
+# production action (systemctl restart) instead of only observing. See
+# README "Watchdog" before enabling: it needs a sudoers NOPASSWD grant
+# scoped to exactly the restart command(s) it runs, or every attempt just
+# fails cleanly (logged to watchdog_actions, nothing hangs).
+watchdog:
+  enabled: false
+  wedge_window_seconds: 1200
+  min_real_requests_in_window: 1
+  restart_cooldown_seconds: 1200
+  max_restarts_per_day: 3
+
 # Recent-prompts panel: this monitor never sees request bodies on its own
 # (Ollama's own logs never contain them, at any verbosity) -- it requires a
 # reverse proxy to mirror a non-blocking copy of each request to

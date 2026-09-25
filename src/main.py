@@ -68,11 +68,12 @@ from src.config import settings
 from src.storage import (
     get_db, execute, query_all, query_one, ring_insert, upgrade_ring_row,
     attach_prompt_metrics, attach_prompt_status, cache_raw_prompt, get_raw_prompt,
-    latest_gpu_samples, query_gpu_samples, resident_model,
+    latest_gpu_samples, query_gpu_samples, resident_model, record_progress,
 )
 from src.collectors import GPUCollector, OllamaStateCollector, LogTailer, AccessLogTailer, ConnectionsCollector, GPUHardwareCollector
 from src.lifecycle import get_tracker
 from src.patterns import analyze_and_store
+from src.watchdog import check_and_remediate_wedged_services
 
 # Global state
 gpu_collector: GPUCollector = GPUCollector()
@@ -207,6 +208,9 @@ async def log_capture_orchestrator():
                     # ("gpu-unified") instead -- normalize to that here, once,
                     # rather than have two service-name conventions that
                     # silently never join.
+                    if log_tailer.is_progress_line(entry):
+                        record_progress(svc.name, entry.timestamp)
+
                     req_info = log_tailer.extract_request_info(entry)
                     if req_info:
                         req_info["service_name"] = svc.name
@@ -263,12 +267,37 @@ async def log_capture_orchestrator():
         await asyncio.sleep(settings.collectors.log_poll_interval_seconds)
 
 
+# Independent of collector_orchestrator's cadence (which drives fast-moving
+# GPU/connection samples) -- a wedge, by definition, can't be judged any
+# faster than settings.watchdog.wedge_window_seconds allows anyway, so this
+# runs on its own fixed 60s tick rather than borrowing gpu_poll_interval_seconds.
+_WATCHDOG_POLL_SECONDS = 60
+
+
+async def watchdog_orchestrator():
+    """No-op every tick when settings.watchdog.enabled is false (the
+    default) -- see src/watchdog.py for what this actually checks."""
+    while True:
+        try:
+            patterns = await check_and_remediate_wedged_services()
+            if patterns:
+                await broadcast_ws({"type": "patterns", "data": [
+                    {"timestamp": p.timestamp, "type": p.pattern_type,
+                     "severity": p.severity, "description": p.description}
+                    for p in patterns
+                ]})
+        except Exception as e:
+            print(f"Watchdog error: {e}")
+        await asyncio.sleep(_WATCHDOG_POLL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     print("Starting sovren-ai-gpu-server...")
     collector_task = asyncio.create_task(collector_orchestrator())
     log_task = asyncio.create_task(log_capture_orchestrator())
+    watchdog_task = asyncio.create_task(watchdog_orchestrator())
     try:
         yield
     finally:
@@ -276,12 +305,17 @@ async def lifespan(app: FastAPI):
         print("Shutting down...")
         collector_task.cancel()
         log_task.cancel()
+        watchdog_task.cancel()
         try:
             await collector_task
         except asyncio.CancelledError:
             pass
         try:
             await log_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await watchdog_task
         except asyncio.CancelledError:
             pass
         gpu_collector.cleanup()
@@ -793,6 +827,17 @@ async def get_patterns(
 async def acknowledge_pattern(pattern_id: int):
     execute("UPDATE patterns SET acknowledged = 1 WHERE id = ?", (pattern_id,))
     return {"ok": True}
+
+
+@app.get("/api/watchdog_actions")
+async def get_watchdog_actions(limit: int = Query(50, le=500)):
+    """Full audit trail for src/watchdog.py -- every restart attempt,
+    whether it actually ran or was suppressed (cooldown/daily cap), so
+    it's always clear why (or why not) a service got restarted."""
+    rows = execute(
+        "SELECT * FROM watchdog_actions ORDER BY timestamp DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # =============================================================================
