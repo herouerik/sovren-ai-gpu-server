@@ -1,31 +1,70 @@
 """Detects a genuinely wedged Ollama service and, if enabled, restarts it.
 
-Built from a real incident (2026-09-25): task 2848714 was mid-generation,
-healthy, decoding at 32.6 tok/s -- then GPU 5 threw a PCIe Uncorrectable
+Built from a real incident (2026-09-25): a request was mid-generation,
+healthy, actively decoding -- then GPU 5 threw a PCIe Uncorrectable
 (Non-Fatal) error mid-CUDA-op, and llama-server went silent instantly. No
 crash, no error surfaced anywhere, no further progress ever -- just ~100%
 CPU spin and every subsequent request admitted-then-aborted, for over 6
-hours until a human noticed and restarted the service by hand.
+hours until a human happened to notice and restarted the service by hand.
 
 Distinguishing a genuine wedge from this fleet's OTHER real incident
 (2026-09-22/23: oversized accumulated context + a client timeout shorter
 than this hardware's real prefill throughput -- looked identical from the
 outside, but was real work, just slow) is the entire point of this module,
 not incidental. That earlier incident logged real progress (a `slot
-print_timing` line) every ~10-15s for the whole multi-minute duration and
-eventually completed successfully. The 2026-09-25 wedge logged ZERO
-progress lines, for hours, despite real traffic continuing to arrive and
-get admitted (task IDs kept incrementing). `service_activity.
-last_progress_ts` -- updated by LogTailer.is_progress_line(), see
-collectors.py -- is what makes telling these apart mechanical instead of
-requiring a human to read logs by hand every time, the way both real
-incidents this fleet has had were actually diagnosed.
+print_timing` line) every ~10-15s for its whole multi-minute duration and
+eventually completed; a genuine wedge logs nothing, ever, no matter how
+long real traffic keeps arriving. `service_activity.last_progress_ts` --
+updated by LogTailer.is_progress_line(), see collectors.py -- is what
+makes this distinction mechanical.
 
-Off by default (`watchdog.enabled: false`) -- this is the one part of this
-app that takes a real production action rather than only observing. See
-README "Watchdog" for the sudoers grant it needs and the safety knobs
-(cooldown, daily cap) that keep it from restart-looping if a restart isn't
-actually the fix for whatever's wrong.
+TWO real bugs were caught and fixed in this module before it could do
+real damage, both by replaying its own logic against real historical data
+rather than trusting it on paper -- worth understanding why, since the
+same mistake is easy to reintroduce:
+
+1. Originally checked `requests` (fed by Ollama's own GIN access-log
+   lines, written only on request COMPLETION) for "did anything succeed".
+   That table structurally CANNOT see a request that never completes --
+   which is exactly what a genuine wedge is. During the real 2026-09-25
+   incident, `requests` has ZERO rows for the entire 6-hour wedge, because
+   nothing ever finished long enough to get a GIN line. A signal that
+   goes silent exactly when there's traffic to judge is useless for that
+   traffic -- it can only ever fire by accident (e.g. an unrelated cron's
+   own successful pings happening to satisfy an "any request" count).
+
+2. That accident is exactly what happened next: this box's own
+   keepwarm_gpu_ollama.py cron sends an empty-prompt keep_alive touch to
+   Ollama's internal bind every 5 minutes, bypassing nginx entirely,
+   which always returns 200 in ~230ms and produces zero llama-server
+   progress lines (confirmed live). Counting it as "traffic present"
+   made three separate, genuinely healthy, merely-idle periods look
+   wedged and triggered three unnecessary restarts in under 15 hours --
+   each one a real, if brief, outage of its own (the cold-load gap that
+   follows any restart), and each one silently spending a slot of
+   max_restarts_per_day for nothing.
+
+The fix for both: use `prompt_summaries` instead of `requests` as the
+"was real traffic attempted" signal. It's written synchronously the
+moment nginx's mirror delivers a copy of a request -- at ARRIVAL time,
+not completion -- so it sees traffic a genuine wedge swallows entirely.
+And since keepwarm's calls go directly to Ollama's internal bind and
+never pass through nginx, they never reach the mirror and never appear
+here at all -- no IP heuristic needed, the data source itself already
+excludes them by construction.
+
+This means the watchdog has a real, hard dependency: `prompt_insight.
+enabled: true` and a working nginx mirror (see README "Prompt insight").
+Without it, `prompt_summaries` never has real data for any service, and
+this module has no way to safely tell "wedged" apart from "quiet, no one
+asked" -- so it stays silent rather than guessing from a signal (like
+`requests`) proven unable to answer the question.
+
+Off by default (`watchdog.enabled: false`) -- this is the one part of
+this app that takes a real production action rather than only observing.
+See README "Watchdog" for the sudoers grant it needs and the safety
+knobs (cooldown, daily cap) that keep it from restart-looping if a
+restart isn't actually the fix for whatever's wrong.
 """
 from __future__ import annotations
 
@@ -37,7 +76,7 @@ from src.config import settings
 from src.storage import execute, last_progress_ts, day_bucket_insert
 from src.patterns import Pattern, PatternAnalyzer
 
-_INFERENCE_ENDPOINTS = ("/api/generate", "/api/chat", "/v1/chat/completions")
+_watchdog_warned_prompt_insight_off = False
 
 
 async def _restart_service(systemd_service: str) -> Tuple[bool, str]:
@@ -80,37 +119,34 @@ async def check_and_remediate_wedged_services() -> List[Pattern]:
     if not cfg.enabled:
         return []
 
+    global _watchdog_warned_prompt_insight_off
+    if not settings.prompt_insight.enabled:
+        if not _watchdog_warned_prompt_insight_off:
+            print("Watchdog: prompt_insight.enabled is false, so prompt_summaries never has real "
+                  "traffic data for any service -- watchdog has no safe signal and will stay silent "
+                  "until it's enabled (see README Watchdog / Prompt insight).")
+            _watchdog_warned_prompt_insight_off = True
+        return []
+
     now = time.time()
     window_cutoff = now - cfg.wedge_window_seconds
-    placeholders = ",".join("?" * len(_INFERENCE_ENDPOINTS))
     patterns: List[Pattern] = []
 
     for svc in settings.get_ollama_services():
         if not svc.enabled or not svc.systemd_service:
             continue
 
-        row = execute(f"""
-            SELECT COUNT(*) as total
-            FROM requests
-            WHERE service_name = ? AND method = 'POST' AND timestamp > ?
-              AND endpoint IN ({placeholders})
-        """, (svc.name, window_cutoff, *_INFERENCE_ENDPOINTS)).fetchone()
+        # prompt_summaries, not `requests`: written at request ARRIVAL
+        # (nginx's mirror), not completion (Ollama's own GIN log) -- see
+        # module docstring for why that distinction is the whole fix.
+        row = execute(
+            "SELECT COUNT(*) as total FROM prompt_summaries WHERE service_name = ? AND timestamp > ?",
+            (svc.name, window_cutoff),
+        ).fetchone()
         total = row["total"] or 0
         if total < cfg.min_real_requests_in_window:
-            continue  # not enough attempted traffic in the window to judge either way
+            continue  # not enough real traffic in the window to judge either way
 
-        # Deliberately NOT "was there a 200 in the requests table" -- this
-        # box's own keepwarm_gpu_ollama.py cron sends an empty-prompt
-        # keep_alive touch every 5 minutes that always returns 200 in
-        # ~230ms (confirmed live: zero llama-server progress lines at the
-        # same timestamp) without ever exercising real inference. Counting
-        # that as "healthy" would mask a genuine wedge forever on this box,
-        # since keepwarm guarantees a 200 every 5 minutes regardless of
-        # whether real generation works at all -- caught by replaying this
-        # exact query against the 2026-09-25 incident's own historical
-        # data before shipping. last_progress_ts is immune to this: it's
-        # only ever set by a real `print_timing`/`launch_slot_` line, which
-        # a bodyless keep_alive touch never produces.
         progress = last_progress_ts(svc.name)
         if progress is not None and progress > window_cutoff:
             continue  # real progress within the window -- healthy, or legitimately slow (Sep 22/23 case)

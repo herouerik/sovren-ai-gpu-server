@@ -109,14 +109,18 @@ class WatchdogConfig(BaseSettings):
     # sudoers NOPASSWD grant scoped to exactly the restart commands this
     # needs (see README "Watchdog").
     enabled: bool = False
-    # A service is "wedged" if real inference traffic arrived, none of it
-    # succeeded, AND llama-server logged zero progress (not even a slow
-    # prefill/decode tick) for this whole window. 1200s (20min) is
+    # A service is "wedged" if real traffic arrived (per prompt_summaries --
+    # NOT `requests`, which only records completions and structurally can't
+    # see a request that never finishes; see src/watchdog.py module
+    # docstring) but llama-server logged zero progress (not even a slow
+    # prefill/decode tick) for this whole window. Requires prompt_insight.
+    # enabled: true -- without it there's no reliable arrival-time signal
+    # and the watchdog stays silent rather than guessing. 1200s (20min) is
     # deliberately well above this fleet's observed cold-load ceiling
     # (~226s) and above any legitimately-slow large-context request (which
     # logs progress every ~10-15s the whole time it's running) -- both of
     # those clear the wedge condition on their own well within this
-    # window. Only a genuine hang (confirmed once: a GPU PCIe uncorrectable
+    # window. Only a genuine hang (confirmed: a GPU PCIe uncorrectable
     # error mid-CUDA-op, see handover doc) sits silent for the full window.
     wedge_window_seconds: int = 1200
     min_real_requests_in_window: int = 1

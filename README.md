@@ -384,28 +384,52 @@ ever — just the process pegged near 100% CPU and every subsequent request
 admitted then aborted, for hours, until a human happened to notice.
 
 **Detection** (`src/watchdog.py`): a service counts as wedged when real
-inference traffic arrived (a `POST` to `/api/generate`, `/api/chat`, or
-`/v1/chat/completions`) but llama-server logged **zero** real progress — not
-even a slow prefill/decode tick — for the entire `wedge_window_seconds`
-(default 1200s/20min). "Progress" means a `slot print_timing` or `slot
-launch_slot_` journald line (`LogTailer.is_progress_line()`), tracked
-per-service in `service_activity.last_progress_ts`. This deliberately does
-**not** treat a `200` response in the `requests` table as proof of health —
-an early version did, and replaying it against this box's own keepwarm
-cron (an empty-prompt keep_alive touch every 5 minutes, always `200` in
-~230ms, zero real inference) showed that would mask a genuine wedge
-forever, since keepwarm guarantees a `200` on a fixed cadence regardless of
-whether real generation works at all. `last_progress_ts` is immune to this:
-a bodyless keep-alive touch never produces a `print_timing`/`launch_slot_`
-line.
+traffic arrived but llama-server logged **zero** real progress — not even a
+slow prefill/decode tick — for the entire `wedge_window_seconds` (default
+1200s/20min). "Progress" means a `slot print_timing` or `slot launch_slot_`
+journald line (`LogTailer.is_progress_line()`), tracked per-service in
+`service_activity.last_progress_ts`.
 
-This same signal is also what tells a genuine wedge apart from this
-fleet's other real incident (an oversized accumulated context + a client
-timeout shorter than this hardware's real prefill throughput — looked
-identical from the outside, but was real work, just slow). That incident
-logged progress every ~10-15s for its whole multi-minute duration and
-eventually completed; a genuine wedge logs nothing, for the entire window,
-no matter how long you wait.
+"Real traffic arrived" is read from **`prompt_summaries`, not the
+`requests` table** — this is load-bearing, not a style choice, and got
+this wrong twice before shipping (both caught by replaying the logic
+against real historical incident data rather than trusting it on paper):
+
+1. `requests` is fed by Ollama's own GIN access-log line, written only
+   once a request *completes*. A genuine wedge is, by definition, a
+   request that never completes — so during the real 2026-09-25 incident,
+   `requests` has **zero** rows for the entire 6-hour wedge. A signal that
+   goes silent exactly when there's something to judge can only ever fire
+   by accident.
+2. That accident happened: this box's own `keepwarm_gpu_ollama.py` cron
+   sends an empty-prompt keep-alive touch to Ollama's internal bind every
+   5 minutes, bypassing nginx, always `200` in ~230ms, zero real
+   inference. Counting that as "traffic present" made three separate,
+   genuinely healthy, merely-*idle* periods look wedged and triggered
+   three unnecessary restarts in under 15 hours — each one a real, if
+   brief, outage of its own (the cold-load gap after any restart), and
+   each one silently spending a slot of `max_restarts_per_day` for
+   nothing real.
+
+`prompt_summaries` fixes both: it's written synchronously the moment
+nginx's mirror delivers a copy of a request — at *arrival* time, not
+completion — so it sees traffic a genuine wedge swallows entirely, and
+since keepwarm's calls bypass nginx and never reach the mirror, they never
+appear here at all (no IP heuristic needed — the data source itself
+excludes them by construction). The real cost: **this feature requires
+`prompt_insight.enabled: true`** and a working nginx mirror (see [Prompt
+insight](#prompt-insight)). Without it, `prompt_summaries` never has real
+data for any service, and the watchdog has no safe way to tell "wedged"
+from "quiet, no one asked" — so it logs one message and stays silent
+rather than falling back to `requests` and repeating mistake #1.
+
+The same `last_progress_ts` signal is also what tells a genuine wedge
+apart from this fleet's other real incident (an oversized accumulated
+context + a client timeout shorter than this hardware's real prefill
+throughput — looked identical from the outside, but was real work, just
+slow). That incident logged progress every ~10-15s for its whole
+multi-minute duration and eventually completed; a genuine wedge logs
+nothing, for the entire window, no matter how long you wait.
 
 **Remediation**: `sudo -n systemctl restart <systemd_service>` for the
 wedged service. `-n` (non-interactive) fails fast with a clear message if
