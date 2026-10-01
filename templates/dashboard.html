@@ -569,9 +569,15 @@ function renderWatchdogActions(rows) {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No watchdog actions -- either disabled, or nothing has ever wedged.</td></tr>';
     return;
   }
+  // Relative "X ago" as the primary display, not just an absolute date --
+  // a long list of identical-looking "restart / suppressed_cooldown" rows
+  // reads as "it keeps restarting right now" at a glance even when every
+  // row predates the last fix by hours. Absolute timestamp still in the
+  // title for exact correlation against logs/incidents.
+  const now = Date.now() / 1000;
   tbody.innerHTML = rows.map(r => `
     <tr>
-      <td>${fmtSince(r.timestamp)}</td>
+      <td title="${fmtSince(r.timestamp)}">${fmtDuration(now - r.timestamp)} ago</td>
       <td>${escHtml(r.service_name)}</td>
       <td>${escHtml(r.action)}</td>
       <td class="${r.outcome === 'success' ? 'hw-ok' : (r.outcome === 'failed' ? 'hw-crit' : 'hw-warn')}">${escHtml(r.outcome)}</td>
