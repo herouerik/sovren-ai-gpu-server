@@ -112,15 +112,15 @@ a{color:inherit}
 .load-chart-wrap{display:flex;flex-direction:column;align-items:center;gap:4px;width:160px;background:var(--surf2);border-radius:2px;padding:6px}
 .load-chart-label{font-size:8px;color:var(--dim);font-variant-numeric:tabular-nums}
 
-/* GPU VITALS -- same flex-wrap-of-fixed-cards idiom as the load strip
-   above, but wider (two charts + a stats line per card, not one). */
-.vitals-strip{display:flex;flex-wrap:wrap;gap:10px}
-.vitals-card{display:flex;flex-direction:column;gap:4px;width:300px;background:var(--surf2);border-radius:2px;padding:8px}
+/* GPU VITALS -- grid, not flex-wrap: cards grow to fill the row width
+   (fitting ~4 across at this dashboard's content width) instead of
+   leaving a gap on the right and stranding the last card alone on its
+   own row the way a fixed-width flex-wrap box does with 7 GPUs. */
+.vitals-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px}
+.vitals-card{display:flex;flex-direction:column;gap:4px;background:var(--surf2);border-radius:2px;padding:8px}
 .vitals-label{font-size:8px;color:var(--dim);font-variant-numeric:tabular-nums}
 .vitals-stats{font-size:8px;color:var(--muted);font-variant-numeric:tabular-nums}
-.vitals-charts{display:flex;gap:6px}
-.vitals-chart-wrap{display:flex;flex-direction:column;align-items:center;gap:2px}
-.vitals-chart-caption{font-size:7px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+.vitals-chart-wrap{position:relative;width:100%;height:82px}
 .vitals-window-select{font:inherit;font-size:9px;background:var(--surf);color:var(--text);border:1px solid var(--border);border-radius:2px;padding:2px 6px}
 
 /* TABLES */
@@ -574,16 +574,7 @@ function renderGpuVitals(data) {
       <div class="vitals-card">
         <div class="vitals-label" id="vitals-lbl-${g.index}">GPU ${g.index}${g.name ? ' · ' + escHtml(g.name) : ''}</div>
         <div class="vitals-stats" id="vitals-stats-${g.index}"></div>
-        <div class="vitals-charts">
-          <div class="vitals-chart-wrap">
-            <canvas id="vitals-temp-${g.index}" width="138" height="54"></canvas>
-            <div class="vitals-chart-caption">temp °C</div>
-          </div>
-          <div class="vitals-chart-wrap">
-            <canvas id="vitals-power-${g.index}" width="138" height="54"></canvas>
-            <div class="vitals-chart-caption">power W</div>
-          </div>
-        </div>
+        <div class="vitals-chart-wrap"><canvas id="vitals-chart-${g.index}"></canvas></div>
       </div>`).join('');
   }
 
@@ -596,33 +587,38 @@ function renderGpuVitals(data) {
     const tempPoints = g.samples.map(s => ({ x: s.ts, y: s.temp_c }));
     const powerPoints = g.samples.map(s => ({ x: s.ts, y: s.power_w }));
 
-    for (const [kind, points, color, bg] of [
-      ['temp', tempPoints, '#c8681e', 'rgba(200,104,30,.15)'],
-      ['power', powerPoints, '#3a6ea5', 'rgba(58,110,165,.15)'],
-    ]) {
-      const key = `${g.index}-${kind}`;
-      const canvas = $(`vitals-${kind}-${g.index}`);
-      if (!canvas) continue;
-      if (!vitalsCharts[key]) {
-        vitalsCharts[key] = new Chart(canvas, {
-          type: 'line',
-          data: { datasets: [{
-            data: points, borderColor: color, backgroundColor: bg,
-            fill: true, tension: 0.15, pointRadius: 0, borderWidth: 1.2,
-          }] },
-          options: {
-            responsive: false, animation: false, parsing: false,
-            scales: {
-              x: { type: 'linear', display: false },
-              y: { type: 'linear', display: false },
-            },
-            plugins: { legend: { display: false }, tooltip: { enabled: false } },
+    const canvas = $('vitals-chart-' + g.index);
+    if (!canvas) continue;
+    if (!vitalsCharts[g.index]) {
+      // Overlaid, not side-by-side: temp (left axis) and power (right
+      // axis) on the same chart so their shapes over time can actually
+      // be compared, with real tick labels on both axes (color-matched
+      // to each series, doubling as a mini legend) so the scale of each
+      // is visible, not just relative shape.
+      vitalsCharts[g.index] = new Chart(canvas, {
+        type: 'line',
+        data: { datasets: [
+          { label: 'temp °C', data: tempPoints, yAxisID: 'y', borderColor: '#c8681e',
+            backgroundColor: 'transparent', fill: false, tension: 0.15, pointRadius: 0, borderWidth: 1.2 },
+          { label: 'power W', data: powerPoints, yAxisID: 'y1', borderColor: '#3a6ea5',
+            backgroundColor: 'transparent', fill: false, tension: 0.15, pointRadius: 0, borderWidth: 1.2 },
+        ] },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
+          scales: {
+            x: { type: 'linear', display: false },
+            y: { type: 'linear', position: 'left', grid: { color: '#1f1e1d' },
+                 ticks: { color: '#c8681e', font: { size: 7 }, maxTicksLimit: 4 } },
+            y1: { type: 'linear', position: 'right', grid: { display: false },
+                  ticks: { color: '#3a6ea5', font: { size: 7 }, maxTicksLimit: 4 } },
           },
-        });
-      } else {
-        vitalsCharts[key].data.datasets[0].data = points;
-        vitalsCharts[key].update('none');
-      }
+          plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        },
+      });
+    } else {
+      vitalsCharts[g.index].data.datasets[0].data = tempPoints;
+      vitalsCharts[g.index].data.datasets[1].data = powerPoints;
+      vitalsCharts[g.index].update('none');
     }
   }
 }
