@@ -29,6 +29,7 @@ collectors:
   ollama_state_poll_interval_seconds: 5
   log_poll_interval_seconds: 1
   connections_poll_interval_seconds: 5
+  gpu_vitals_poll_interval_seconds: 60
 
 storage:
   db_path: "data/monitor.db"
@@ -40,6 +41,7 @@ storage:
   connection_bucket_seconds: 30
   raw_ring_capacity: 100000       # requests, task_samples
   gpu_sample_memory_minutes: 240  # in-memory only, never persisted
+  gpu_vitals_retention_days: 30
 
 patterns:
   latency_spike_threshold_ms: 5000

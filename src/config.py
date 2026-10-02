@@ -41,6 +41,12 @@ class CollectorsConfig(BaseSettings):
     ollama_state_poll_interval_seconds: int = 5
     log_poll_interval_seconds: int = 1
     connections_poll_interval_seconds: int = 5
+    # Separate, coarser cadence for the durable temperature/power history
+    # behind the "GPU Vitals" panel -- recording every gpu_poll_interval_
+    # seconds (2s) tick here would be 30x the row count for no benefit on
+    # a chart spanning days; this just throttles which already-collected
+    # gpu_samples tick gets written to gpu_vitals.
+    gpu_vitals_poll_interval_seconds: int = 60
 
     model_config = SettingsConfigDict(extra="allow")
 
@@ -63,6 +69,11 @@ class StorageConfig(BaseSettings):
     # GPU load samples (util/mem/temp/power) are kept in memory only, never
     # persisted -- this many minutes of history per GPU.
     gpu_sample_memory_minutes: int = 240
+    # Durable temperature/power history (the "GPU Vitals" panel) -- its own,
+    # longer retention than event_retention_days since this is meant to
+    # answer "how hot/power-hungry has this card run over the last N days",
+    # not a recent-incidents window.
+    gpu_vitals_retention_days: int = 30
 
     model_config = SettingsConfigDict(extra="allow")
 

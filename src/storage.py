@@ -193,6 +193,31 @@ def _init_schema(db: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_watchdog_actions_timestamp ON watchdog_actions(timestamp);
         CREATE INDEX IF NOT EXISTS idx_watchdog_actions_day_slot ON watchdog_actions(day_slot);
 
+        -- Temperature/power history, one row per GPU per poll tick -- NOT
+        -- the same thing as `gpu_samples` (in-memory only, a few hours,
+        -- every ~2s): this is the durable, longer-range history behind
+        -- the "GPU Vitals" dashboard panel, written far more coarsely
+        -- (gpu_vitals_poll_interval_seconds, default 60s -- recording
+        -- every 2s tick here would be 30x the row count for no real
+        -- benefit on a chart spanning days). Same day-slot retention
+        -- scheme as patterns/load_cycles/watchdog_actions, just with its
+        -- own (longer) retention window -- see
+        -- settings.storage.gpu_vitals_retention_days.
+        CREATE TABLE IF NOT EXISTS gpu_vitals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_slot INTEGER NOT NULL,
+            epoch_day INTEGER NOT NULL,
+            timestamp REAL NOT NULL,
+            gpu_index INTEGER NOT NULL,
+            name TEXT,
+            temperature_c REAL,
+            power_watts REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_gpu_vitals_timestamp ON gpu_vitals(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_gpu_vitals_gpu_index ON gpu_vitals(gpu_index);
+        CREATE INDEX IF NOT EXISTS idx_gpu_vitals_day_slot ON gpu_vitals(day_slot);
+
         -- `connection_window_hours` sliding window at `connection_bucket_
         -- seconds` resolution. One row per (service_name, bucket_index); a
         -- bucket's index recurs every connection_window_hours, so writing

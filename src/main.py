@@ -69,6 +69,7 @@ from src.storage import (
     get_db, execute, query_all, query_one, ring_insert, upgrade_ring_row,
     attach_prompt_metrics, attach_prompt_status, cache_raw_prompt, get_raw_prompt,
     latest_gpu_samples, query_gpu_samples, resident_model, record_progress,
+    day_bucket_insert,
 )
 from src.collectors import GPUCollector, OllamaStateCollector, LogTailer, AccessLogTailer, ConnectionsCollector, GPUHardwareCollector
 from src.lifecycle import get_tracker
@@ -113,6 +114,7 @@ async def broadcast_ws(message: Dict[str, Any]):
 async def collector_orchestrator():
     """Background task that runs all collectors and pattern analysis."""
     last_gpu_hw = 0.0
+    last_gpu_vitals = 0.0
     last_wal_checkpoint = 0.0
     wal_checkpoint_interval_seconds = 60
     tracker = get_tracker()
@@ -122,6 +124,18 @@ async def collector_orchestrator():
             gpu_samples = await gpu_collector.collect()
             await gpu_collector.store_samples(gpu_samples)
             await broadcast_ws({"type": "gpu_update", "data": [s.__dict__ for s in gpu_samples]})
+
+            # GPU Vitals: durable temp/power history, far coarser than the
+            # ~2s in-memory gpu_samples tick above -- see gpu_vitals table
+            # comment and settings.collectors.gpu_vitals_poll_interval_seconds.
+            now_vitals = time.time()
+            if gpu_samples and now_vitals - last_gpu_vitals > settings.collectors.gpu_vitals_poll_interval_seconds:
+                for s in gpu_samples:
+                    day_bucket_insert("gpu_vitals", {
+                        "timestamp": s.timestamp, "gpu_index": s.gpu_index, "name": s.name,
+                        "temperature_c": s.temperature_c, "power_watts": s.power_watts,
+                    }, timestamp=s.timestamp, retention_days=settings.storage.gpu_vitals_retention_days)
+                last_gpu_vitals = now_vitals
 
             # Ollama state — also feeds the lifecycle tracker (eviction
             # detection, keep_alive_expires_at capture)
@@ -562,6 +576,64 @@ async def get_gpus():
         {**s, "service_name": service_by_gpu.get(s["gpu_index"])}
         for s in latest_gpu_samples()
     ]
+
+
+@app.get("/api/gpu_vitals")
+async def get_gpu_vitals(hours: int = Query(24, ge=1, le=720)):
+    """Durable temperature/power history per GPU (see the gpu_vitals table
+    comment in storage.py) -- a much longer, coarser-grained view than
+    /api/gpus' live ~2s-tick snapshot. max 720h (30 days) matches
+    storage.gpu_vitals_retention_days' default."""
+    cutoff = time.time() - hours * 3600
+    rows = execute(
+        "SELECT gpu_index, name, timestamp, temperature_c, power_watts "
+        "FROM gpu_vitals WHERE timestamp > ? ORDER BY gpu_index, timestamp",
+        (cutoff,),
+    ).fetchall()
+
+    by_gpu: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        idx = r["gpu_index"]
+        entry = by_gpu.setdefault(idx, {"index": idx, "name": r["name"], "samples": []})
+        entry["samples"].append({
+            "ts": r["timestamp"], "temp_c": r["temperature_c"], "power_w": r["power_watts"],
+        })
+
+    result = []
+    for idx in sorted(by_gpu):
+        entry = by_gpu[idx]
+        samples = entry["samples"]
+        temps = [s["temp_c"] for s in samples if s["temp_c"] is not None]
+        powers = [s["power_w"] for s in samples if s["power_w"] is not None]
+
+        # Trapezoidal integration over actual sample spacing (not assumed
+        # fixed-interval) -- correct even across a gap (restart, a missed
+        # tick) rather than silently over/under-counting energy there.
+        total_kwh = 0.0
+        pw_samples = [s for s in samples if s["power_w"] is not None]
+        for prev, cur in zip(pw_samples, pw_samples[1:]):
+            dt_hours = (cur["ts"] - prev["ts"]) / 3600.0
+            if 0 < dt_hours < 1:  # skip anything that looks like a gap, not a real interval
+                avg_w = (prev["power_w"] + cur["power_w"]) / 2.0
+                total_kwh += (avg_w * dt_hours) / 1000.0
+
+        result.append({
+            "index": idx,
+            "name": entry["name"],
+            "samples": samples,
+            "ts_oldest": samples[0]["ts"] if samples else None,
+            "ts_newest": samples[-1]["ts"] if samples else None,
+            "stats": {
+                "min_temp": min(temps) if temps else None,
+                "max_temp": max(temps) if temps else None,
+                "avg_temp": sum(temps) / len(temps) if temps else None,
+                "min_power": min(powers) if powers else None,
+                "max_power": max(powers) if powers else None,
+                "avg_power": sum(powers) / len(powers) if powers else None,
+                "total_kwh": round(total_kwh, 3),
+            },
+        })
+    return {"gpus": result}
 
 
 @app.get("/api/load_cycles")

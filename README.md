@@ -618,6 +618,7 @@ this is a display/detection distinction only, the underlying `load_cycles` rows 
 | `GET /api/metrics/summary` | Aggregated stats by model/GPU/caller |
 | `GET /api/metrics/timeseries` | Time-series data for charts |
 | `GET /api/gpus` | Current GPU load state |
+| `GET /api/gpu_vitals` | Durable temperature/power history per GPU, `hours` param (default 24, max 720/30d) — the data source for the "GPU Vitals" dashboard panel |
 | `GET /api/ollama/services` | Ollama service status & loaded models |
 | `GET /api/patterns` | Detected anomalies |
 | `GET /api/requested_models` | Every distinct model actually *requested* per service in a window (default 1h), with a count and whether it matches what's resident — the data source for the "Requested Models" dashboard panel and the `rejected_model_mismatch` pattern; catches wasted/rejected traffic that never shows up in `load_cycles` |
@@ -639,7 +640,10 @@ Open `http://localhost:8082` — single-page, health-first layout:
   see [Pattern Detection](#pattern-detection)'s `fast_reject_max_duration_seconds` note,
   gray=superseded, pulsing yellow=loading now), hover for exact timing/trigger
 - **GPU hardware checklist** — ECC/retired-pages per GPU, a checklist not a chart
-- **GPU compute strip** — live per-GPU utilization
+- **GPU compute strip** — live per-GPU utilization, ~90s in-memory window
+- **GPU Vitals** — durable per-GPU temperature/power history (24h/7d/30d selector),
+  min/avg/max temp and total kWh per card — distinct from the compute strip above,
+  which is live but never persisted; this survives a restart
 - **Connections chart** — established-connection count over time
 - **Real work vs. heartbeat** — how much of recent traffic is genuine vs. a health probe
 - **Patterns & alerts**, **requested models vs. resident** (every model actually requested
