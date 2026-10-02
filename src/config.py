@@ -151,8 +151,19 @@ class PromptInsightConfig(BaseSettings):
     # to mechanical truncation, no error.
     summarizer_service: Optional[str] = None
     summarizer_timeout_seconds: float = 20.0
+    # The DEFAULT, mechanical, always-on summary shown in the Recent
+    # Prompts list row -- stays short on purpose, it's a one-line label.
     fallback_max_words: int = 40
     fallback_max_chars: int = 200
+    # The on-demand "Interpret and explain" result (see POST
+    # /api/prompt_interpret/{row_id}) is a different use case -- a real
+    # explanation someone deliberately asked to read, not a list-row
+    # label -- so it gets a much larger budget, both for how much the
+    # model is allowed to generate (num_predict) and how much of that
+    # output gets kept rather than cut off.
+    interpret_num_predict: int = 300
+    interpret_max_words: int = 220
+    interpret_max_chars: int = 1200
     ring_capacity: int = 100
 
     model_config = SettingsConfigDict(extra="allow")

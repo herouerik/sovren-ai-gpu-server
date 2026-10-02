@@ -277,7 +277,18 @@ def _init_schema(db: sqlite3.Connection):
             -- HTTP status" from a reverse proxy's own access log.
             status TEXT DEFAULT 'pending',
             status_detail TEXT,
-            latency_ms REAL
+            latency_ms REAL,
+            -- On-demand "Interpret and explain" result (POST
+            -- /api/prompt_interpret/{id}) -- deliberately a SEPARATE
+            -- column from `summary`, not an overwrite of it: `summary`
+            -- drives the compact one-line Recent Prompts list row
+            -- (unbounded-width, no CSS clipping -- a long explanation
+            -- in there would blow that row out far wider than its
+            -- neighbors), while this is the full, longer explanation
+            -- shown only in the row's popup once someone actually asks
+            -- for it. NULL until interpreted; persists so reopening an
+            -- already-interpreted row doesn't re-run the LLM call.
+            interpretation TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_prompt_summaries_timestamp ON prompt_summaries(timestamp);
@@ -316,6 +327,8 @@ def _migrate_schema(db: sqlite3.Connection):
         db.execute("ALTER TABLE prompt_summaries ADD COLUMN status_detail TEXT")
     if "latency_ms" not in prompt_cols:
         db.execute("ALTER TABLE prompt_summaries ADD COLUMN latency_ms REAL")
+    if "interpretation" not in prompt_cols:
+        db.execute("ALTER TABLE prompt_summaries ADD COLUMN interpretation TEXT")
     db.commit()
 
 

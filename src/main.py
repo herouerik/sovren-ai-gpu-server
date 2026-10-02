@@ -945,27 +945,34 @@ def _extract_prompt_text(endpoint: str, body: Dict[str, Any]) -> Optional[str]:
 
 
 def _looks_like_verbatim_echo(text: str, prompt_text: str) -> bool:
-    """Reject LLM output that's clearly not a summary. Observed live on this
-    box: small models asked to summarize a diff- or JSON-shaped prompt often
-    slip into completion mode and echo/continue the input instead of
-    describing it. Two tells:
-    - structural: a code fence or embedded newline -- a real one-or-two-
-      sentence summary is always plain single-line text.
+    """Reject LLM output that's clearly not a real explanation, for
+    _run_summarizer's on-demand "Interpret and explain" result. Observed
+    live on this box: small models asked to explain a diff- or JSON-shaped
+    prompt sometimes slip into completion mode and echo/continue the input
+    instead of describing it. Two tells:
+    - structural: a code fence -- a real explanation never legitimately
+      needs one, this is always a sign the model started completing code
+      instead of describing it. (A bare newline is NOT checked here on
+      its own anymore -- the instruction now explicitly allows "a short
+      paragraph," so multi-line prose is an expected, good result, not a
+      red flag. That used to be true back when this only ever asked for a
+      strict one-line label; it stopped being a reliable echo signal the
+      moment a longer explanation became the actual goal.)
     - content: the output is itself a long verbatim substring of the
-      prompt it was asked to summarize. Catches single-line echoes a code
-      fence/newline check misses entirely -- observed live: given a diff-
-      shaped prompt, the model echoed just its filename line back
-      ("diff -u tests/test_x.py.orig tests/test_x.py"), one line, no
-      fence, so the structural check alone let it straight through.
-    20 chars is deliberately short -- a genuine summary reusing a filename
-    or a few words from the prompt is normal and fine; this is aimed at
-    "the whole output is a chunk of the input," not "shares vocabulary
-    with it." A false positive here just means falling back to the
-    mechanical truncation, which is already a reasonable result on its
+      prompt it was asked to explain. Catches echoes the fence check
+      misses entirely -- observed live: given a diff-shaped prompt, the
+      model echoed just its filename line back ("diff -u tests/test_x.py
+      .orig tests/test_x.py"), no fence, so the structural check alone let
+      it straight through.
+    20 chars is deliberately short -- a genuine explanation reusing a
+    filename or a few words from the prompt is normal and fine; this is
+    aimed at "the whole output is a chunk of the input," not "shares
+    vocabulary with it." A false positive here just means falling back to
+    the mechanical truncation, which is already a reasonable result on its
     own -- not something worth tuning finer than this.
     """
     stripped = text.strip()
-    if "```" in stripped or "\n" in stripped:
+    if "```" in stripped:
         return True
     if len(stripped) >= 20 and stripped in prompt_text:
         return True
@@ -999,10 +1006,11 @@ async def _run_summarizer(prompt_text: str) -> Optional[str]:
     if SUMMARIZER_BUSY:
         raise _SummarizerBusy()
     instruction = (
-        f"Summarize the following prompt in one or two plain sentences, at most "
-        f"{cfg.fallback_max_chars} characters, describing what is being asked for. "
-        "No code, no markdown, no diffs, no quotes -- plain text only, and never "
-        "repeat any of the prompt's own text verbatim:\n\n" + prompt_text[:4000]
+        "Explain, in clear plain language, what the following prompt is actually "
+        "asking for and why -- a real reader-friendly explanation, not a one-line "
+        "label: a short paragraph is fine. No code, no markdown, no diffs, no "
+        "quotes -- plain text only, and never repeat any of the prompt's own text "
+        "verbatim:\n\n" + prompt_text[:4000]
     )
     SUMMARIZER_BUSY = True
     try:
@@ -1018,13 +1026,13 @@ async def _run_summarizer(prompt_text: str) -> Optional[str]:
                       # 16384 must match ollama-meta.service's OLLAMA_CONTEXT_LENGTH default
                       # (used by any caller that omits num_ctx, e.g. .117) -- any mismatch
                       # between the two reproduces the same reload flap at different numbers.
-                      "options": {"num_predict": 80, "num_ctx": 16384}},
+                      "options": {"num_predict": cfg.interpret_num_predict, "num_ctx": 16384}},
             )
         resp.raise_for_status()
         raw = resp.json().get("response", "")
         if _looks_like_verbatim_echo(raw, prompt_text):
             return None  # model echoed/continued the input -- nothing useful to show
-        summary = _truncate_to_words(raw, cfg.fallback_max_words, cfg.fallback_max_chars)
+        summary = _truncate_to_words(raw, cfg.interpret_max_words, cfg.interpret_max_chars)
         return summary if summary and summary != "(empty prompt)" else None
     finally:
         SUMMARIZER_BUSY = False
@@ -1129,20 +1137,27 @@ async def interpret_prompt(row_id: int, timestamp: float = Query(...)):
     background summarization. Deliberately synchronous (the caller is a
     button click expecting a result, not a fire-and-forget mirror
     response): real latency here (summarizer load + generate) is the
-    accepted tradeoff for not running this on every mirrored prompt."""
+    accepted tradeoff for not running this on every mirrored prompt.
+
+    Writes to the row's `interpretation` column, NOT `summary` -- summary
+    drives the compact, unbounded-width Recent Prompts list row (no CSS
+    clipping there; a long explanation would blow that row out far wider
+    than its neighbors). `interpretation` persists separately so reopening
+    an already-interpreted row shows the saved explanation without
+    re-running the LLM call."""
     text = get_raw_prompt(row_id, timestamp)
     if text is None:
         return JSONResponse({"error": "raw prompt not available (evicted or predates last restart)"}, status_code=404)
     try:
-        summary = await _run_summarizer(text)
+        interpretation = await _run_summarizer(text)
     except _SummarizerUnavailable:
         return JSONResponse({"error": "no summarizer configured (prompt_insight.summarizer_service)"}, status_code=503)
     except _SummarizerBusy:
         return JSONResponse({"error": "summarizer is busy with another interpretation, try again shortly"}, status_code=503)
-    if summary is None:
+    if interpretation is None:
         return JSONResponse({"error": "summarizer returned nothing usable"}, status_code=502)
-    upgrade_ring_row("prompt_summaries", row_id, timestamp, {"summary": summary, "source": "llm"})
-    return {"summary": summary}
+    upgrade_ring_row("prompt_summaries", row_id, timestamp, {"interpretation": interpretation})
+    return {"interpretation": interpretation}
 
 
 @app.websocket("/ws")

@@ -315,12 +315,19 @@ steps and paths change.
 
 **Summarization** — every mirrored prompt gets the mechanical fallback
 (first `fallback_max_words` words / `fallback_max_chars` chars, whichever
-is shorter) by default, and that's all, for every row, always. A real
-LLM-generated one-or-two-sentence summary is available **on demand only**:
-click a row to open its full-text popup, then click "✨ Interpret and
-explain" to ask `prompt_insight.summarizer_service` (a reachable entry in
-`ollama.services`) for one, which replaces the stored summary in place
-once it returns (`POST /api/prompt_interpret/{row_id}`).
+is shorter) by default, and that's all, for every row, always — this is
+what drives the compact Recent Prompts *list* row, which has no CSS
+clipping (it's `width:max-content`), so it has to stay short on purpose.
+A real, full-length LLM explanation (`interpret_max_words`/
+`interpret_max_chars`, several short paragraphs' worth — a genuinely
+different use case from the one-line list label, not just a longer
+version of it) is available **on demand only**: click a row to open its
+full-text popup, then click "✨ Interpret and explain" (top of the popup)
+to ask `prompt_insight.summarizer_service` (a reachable entry in
+`ollama.services`) for one (`POST /api/prompt_interpret/{row_id}`). It's
+stored in a separate `interpretation` column, never overwriting the row's
+own `summary` — reopening an already-interpreted row shows the saved
+explanation instantly (button reads "Re-interpret"), no re-run needed.
 
 This used to run automatically, as a background task, for every single
 mirrored prompt — found live that almost nobody actually reads most of

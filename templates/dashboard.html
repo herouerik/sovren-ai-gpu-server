@@ -173,7 +173,7 @@ table.data tr:hover td{background:var(--surf2)}
 .prompt-popup-close{cursor:pointer;color:var(--muted);padding:0 4px;font-size:11px}
 .prompt-popup-close:hover{color:var(--text)}
 .prompt-popup-body{font-size:10px;color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5}
-.prompt-popup-footer{margin-top:10px;padding-top:8px;border-top:1px solid var(--border)}
+.prompt-popup-interpret{margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border)}
 .prompt-interpret-btn{font:inherit;font-size:9px;letter-spacing:.04em;background:var(--surf);color:var(--accent);border:1px solid var(--accent);border-radius:2px;padding:4px 10px;cursor:pointer}
 .prompt-interpret-btn:hover:not(:disabled){background:var(--accentA)}
 .prompt-interpret-btn:disabled{opacity:.6;cursor:default}
@@ -307,11 +307,11 @@ canvas{max-width:100%}
       <span id="promptPopupMeta"></span>
       <span class="prompt-popup-close" onclick="closePromptPopup()" title="Close">✕</span>
     </div>
-    <div class="prompt-popup-body" id="promptPopupBody"></div>
-    <div class="prompt-popup-footer">
+    <div class="prompt-popup-interpret">
       <button class="prompt-interpret-btn" id="promptInterpretBtn" onclick="interpretPrompt()">✨ Interpret and explain</button>
       <div class="prompt-interpret-result" id="promptInterpretResult"></div>
     </div>
+    <div class="prompt-popup-body" id="promptPopupBody"></div>
   </div>
 
 </div>
@@ -654,13 +654,21 @@ async function togglePromptPopup(el, id, ts, svc, model) {
 
   $('promptPopupMeta').textContent = `${svc}${model ? ' · ' + model : ''} · ${fmtTime(ts)}`;
   $('promptPopupBody').textContent = text;
-  promptPopupCurrent = { id, ts };
+  promptPopupCurrent = { id, ts, el };
   const btn = $('promptInterpretBtn');
   btn.disabled = false;
-  btn.textContent = '✨ Interpret and explain';
   const result = $('promptInterpretResult');
-  result.textContent = '';
-  result.className = 'prompt-interpret-result';
+  // Already interpreted earlier (persisted server-side) -- show it right
+  // away, no need to re-run the LLM call just to reopen this row.
+  if (el.dataset.interpretation) {
+    result.textContent = el.dataset.interpretation;
+    result.className = 'prompt-interpret-result ok';
+    btn.textContent = '✨ Re-interpret';
+  } else {
+    result.textContent = '';
+    result.className = 'prompt-interpret-result';
+    btn.textContent = '✨ Interpret and explain';
+  }
   popup.hidden = false;
   promptPopupOpenFor = id;
 
@@ -682,7 +690,7 @@ function closePromptPopup() {
 // latency (summarizer load + generate) is the accepted tradeoff.
 async function interpretPrompt() {
   if (!promptPopupCurrent) return;
-  const { id, ts } = promptPopupCurrent;
+  const { id, ts, el } = promptPopupCurrent;
   const btn = $('promptInterpretBtn');
   const result = $('promptInterpretResult');
   btn.disabled = true;
@@ -693,9 +701,10 @@ async function interpretPrompt() {
     const r = await fetch(`/api/prompt_interpret/${id}?timestamp=${ts}`, { method: 'POST' });
     const data = await r.json();
     if (r.ok) {
-      result.textContent = data.summary;
+      result.textContent = data.interpretation;
       result.className = 'prompt-interpret-result ok';
-      btn.textContent = '✨ Interpret and explain';
+      btn.textContent = '✨ Re-interpret';
+      if (el) el.dataset.interpretation = data.interpretation;  // cache so reopening shows it instantly
     } else {
       result.textContent = data.error || 'Failed to interpret.';
       result.className = 'prompt-interpret-result err';
@@ -727,7 +736,7 @@ function renderPrompts(prompts) {
       <span class="prompt-svc">${escHtml(p.service_name)}${p.model ? ' · ' + escHtml(p.model) : ''}</span>
       <span class="prompt-ip" title="client IP">${escHtml(p.client_ip) || '—'}</span>
       <span class="prompt-metrics ${p.ttft_ms == null ? 'status-' + escHtml(p.status) : ''}" title="${escHtml(fmtPromptMetricsTitle(p))}">${escHtml(fmtPromptMetrics(p))}</span>
-      <span class="prompt-text" title="${escHtml(p.summary)}"
+      <span class="prompt-text" title="${escHtml(p.summary)}" data-interpretation="${escHtml(p.interpretation || '')}"
             onclick="togglePromptPopup(this, ${p.id}, ${p.timestamp}, '${p.service_name.replace(/'/g,"\\'")}', ${p.model ? `'${p.model.replace(/'/g,"\\'")}'`  : 'null'})">${escHtml(p.summary)}</span>
     </div>`).join('');
 }
