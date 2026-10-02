@@ -643,7 +643,12 @@ Open `http://localhost:8082` — single-page, health-first layout:
 - **GPU compute strip** — live per-GPU utilization, ~90s in-memory window
 - **GPU Vitals** — durable per-GPU temperature/power history (24h/7d/30d selector),
   min/avg/max temp and total kWh per card — distinct from the compute strip above,
-  which is live but never persisted; this survives a restart
+  which is live but never persisted; this survives a restart. Both axes are fixed,
+  not auto-scaled per card: temp to a shared 0-80°C, power to *that GPU's own*
+  `nvidia-smi power.limit` (not one shared number — this box's RTX 2080 Ti reports
+  260W, its P100s 250W) — otherwise two cards both idling at ~10% of their own cap
+  can look like one is drawing "2x" the other, just because their absolute wattage
+  differs
 - **Connections chart** — established-connection count over time
 - **Real work vs. heartbeat** — how much of recent traffic is genuine vs. a health probe
 - **Patterns & alerts**, **requested models vs. resident** (every model actually requested

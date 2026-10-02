@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 import psutil
-from pynvml import nvmlInit, nvmlShutdown, nvmlDeviceGetHandleByIndex, nvmlDeviceGetName, nvmlDeviceGetMemoryInfo, nvmlDeviceGetUtilizationRates, nvmlDeviceGetTemperature, nvmlDeviceGetPowerUsage
+from pynvml import nvmlInit, nvmlShutdown, nvmlDeviceGetHandleByIndex, nvmlDeviceGetName, nvmlDeviceGetMemoryInfo, nvmlDeviceGetUtilizationRates, nvmlDeviceGetTemperature, nvmlDeviceGetPowerUsage, nvmlDeviceGetPowerManagementLimit
 
 from src.config import settings
 

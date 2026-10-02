@@ -134,6 +134,7 @@ async def collector_orchestrator():
                     day_bucket_insert("gpu_vitals", {
                         "timestamp": s.timestamp, "gpu_index": s.gpu_index, "name": s.name,
                         "temperature_c": s.temperature_c, "power_watts": s.power_watts,
+                        "power_limit_watts": s.power_limit_watts,
                     }, timestamp=s.timestamp, retention_days=settings.storage.gpu_vitals_retention_days)
                 last_gpu_vitals = now_vitals
 
@@ -586,7 +587,7 @@ async def get_gpu_vitals(hours: int = Query(24, ge=1, le=720)):
     storage.gpu_vitals_retention_days' default."""
     cutoff = time.time() - hours * 3600
     rows = execute(
-        "SELECT gpu_index, name, timestamp, temperature_c, power_watts "
+        "SELECT gpu_index, name, timestamp, temperature_c, power_watts, power_limit_watts "
         "FROM gpu_vitals WHERE timestamp > ? ORDER BY gpu_index, timestamp",
         (cutoff,),
     ).fetchall()
@@ -594,10 +595,14 @@ async def get_gpu_vitals(hours: int = Query(24, ge=1, le=720)):
     by_gpu: Dict[int, Dict[str, Any]] = {}
     for r in rows:
         idx = r["gpu_index"]
-        entry = by_gpu.setdefault(idx, {"index": idx, "name": r["name"], "samples": []})
+        entry = by_gpu.setdefault(idx, {"index": idx, "name": r["name"], "samples": [], "power_limit_w": None})
         entry["samples"].append({
             "ts": r["timestamp"], "temp_c": r["temperature_c"], "power_w": r["power_watts"],
         })
+        # Latest non-null wins -- a card's power cap essentially never
+        # changes, but this way a single bad/missing read never blanks it.
+        if r["power_limit_watts"] is not None:
+            entry["power_limit_w"] = r["power_limit_watts"]
 
     result = []
     for idx in sorted(by_gpu):
@@ -620,6 +625,7 @@ async def get_gpu_vitals(hours: int = Query(24, ge=1, le=720)):
         result.append({
             "index": idx,
             "name": entry["name"],
+            "power_limit_w": entry["power_limit_w"],
             "samples": samples,
             "ts_oldest": samples[0]["ts"] if samples else None,
             "ts_newest": samples[-1]["ts"] if samples else None,

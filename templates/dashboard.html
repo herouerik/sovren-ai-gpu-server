@@ -595,6 +595,17 @@ function renderGpuVitals(data) {
       // be compared, with real tick labels on both axes (color-matched
       // to each series, doubling as a mini legend) so the scale of each
       // is visible, not just relative shape.
+      //
+      // Both axes are fixed to each card's own real ceiling, not auto-
+      // scaled -- temp to a shared 0-80C (covers this hardware's real
+      // range with headroom under anything throttle-worthy), power to
+      // THIS GPU's own nvidia-smi power.limit (not a single shared
+      // number across cards: observed live, this box's RTX 2080 Ti
+      // reports 260W, its P100s 250W -- close, but not equal). Without
+      // this, two cards both idling at ~10% of their own cap can look
+      // like one is drawing "2x" the other, just because their absolute
+      // wattage differs.
+      const powerMax = g.power_limit_w || undefined;  // undefined -> Chart.js auto-scales if ever missing
       vitalsCharts[g.index] = new Chart(canvas, {
         type: 'line',
         data: { datasets: [
@@ -607,14 +618,9 @@ function renderGpuVitals(data) {
           responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
           scales: {
             x: { type: 'linear', display: false },
-            // Fixed 0-80°C on every card, not auto-scaled per GPU -- a
-            // shared axis is what makes the cards visually comparable at
-            // a glance (same swing can mean very different severity on
-            // an auto-scaled axis); 80 covers this hardware's real range
-            // with headroom under anything throttle-worthy.
             y: { type: 'linear', position: 'left', min: 0, max: 80, grid: { color: '#1f1e1d' },
                  ticks: { color: '#c8681e', font: { size: 7 }, maxTicksLimit: 4 } },
-            y1: { type: 'linear', position: 'right', grid: { display: false },
+            y1: { type: 'linear', position: 'right', min: 0, max: powerMax, grid: { display: false },
                   ticks: { color: '#3a6ea5', font: { size: 7 }, maxTicksLimit: 4 } },
           },
           plugins: { legend: { display: false }, tooltip: { enabled: false } },
@@ -623,6 +629,7 @@ function renderGpuVitals(data) {
     } else {
       vitalsCharts[g.index].data.datasets[0].data = tempPoints;
       vitalsCharts[g.index].data.datasets[1].data = powerPoints;
+      if (g.power_limit_w) vitalsCharts[g.index].options.scales.y1.max = g.power_limit_w;
       vitalsCharts[g.index].update('none');
     }
   }

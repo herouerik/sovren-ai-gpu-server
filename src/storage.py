@@ -211,7 +211,14 @@ def _init_schema(db: sqlite3.Connection):
             gpu_index INTEGER NOT NULL,
             name TEXT,
             temperature_c REAL,
-            power_watts REAL
+            power_watts REAL,
+            -- Each card's own real power cap (nvidia-smi power.limit) --
+            -- not assumed equal across GPUs (observed live: this box's
+            -- RTX 2080 Ti reports 260W, its P100s 250W). Lets the GPU
+            -- Vitals power axis scale to each card's own ceiling instead
+            -- of a shared guessed number, so "10% of capacity" reads the
+            -- same height on every card regardless of hardware mix.
+            power_limit_watts REAL
         );
 
         CREATE INDEX IF NOT EXISTS idx_gpu_vitals_timestamp ON gpu_vitals(timestamp);
@@ -354,6 +361,10 @@ def _migrate_schema(db: sqlite3.Connection):
         db.execute("ALTER TABLE prompt_summaries ADD COLUMN latency_ms REAL")
     if "interpretation" not in prompt_cols:
         db.execute("ALTER TABLE prompt_summaries ADD COLUMN interpretation TEXT")
+
+    vitals_cols = {row[1] for row in db.execute("PRAGMA table_info(gpu_vitals)").fetchall()}
+    if "power_limit_watts" not in vitals_cols:
+        db.execute("ALTER TABLE gpu_vitals ADD COLUMN power_limit_watts REAL")
     db.commit()
 
 
