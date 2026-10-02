@@ -607,7 +607,12 @@ function renderGpuVitals(data) {
           responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
           scales: {
             x: { type: 'linear', display: false },
-            y: { type: 'linear', position: 'left', grid: { color: '#1f1e1d' },
+            // Fixed 0-80°C on every card, not auto-scaled per GPU -- a
+            // shared axis is what makes the cards visually comparable at
+            // a glance (same swing can mean very different severity on
+            // an auto-scaled axis); 80 covers this hardware's real range
+            // with headroom under anything throttle-worthy.
+            y: { type: 'linear', position: 'left', min: 0, max: 80, grid: { color: '#1f1e1d' },
                  ticks: { color: '#c8681e', font: { size: 7 }, maxTicksLimit: 4 } },
             y1: { type: 'linear', position: 'right', grid: { display: false },
                   ticks: { color: '#3a6ea5', font: { size: 7 }, maxTicksLimit: 4 } },
