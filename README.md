@@ -313,22 +313,32 @@ covers moving Ollama's own bind off the port nginx needs to take over
 instead of `systemctl`. Same mirror mechanism underneath; only the install
 steps and paths change.
 
-**Summarization** — every mirrored prompt gets a mechanical fallback first
+**Summarization** — every mirrored prompt gets the mechanical fallback
 (first `fallback_max_words` words / `fallback_max_chars` chars, whichever
-is shorter, stored immediately, synchronously). If
-`prompt_insight.summarizer_service` names a reachable entry in
-`ollama.services`, a background task then asks it for a real one-or-two-
-sentence summary (same `fallback_max_chars` cap applied to whatever it
-returns, so a model that ignores the length instruction still can't blow
-past it) and upgrades the stored row in place — this never blocks the
-mirror response, and a summarizer that's unset, unreachable, or slow just
-means every prompt stays on the mechanical fallback, silently, no error.
-Point it at hardware that isn't part of your real inference pool if you
-have any (an otherwise-idle GPU, a CPU-only Ollama instance) — pointing it
-at the same pool being monitored means summarization competes with real
-inference for capacity, and can time out under load (observed directly
-while building this: a real generate call to the busy production pool on
-this box timed out at 20s with zero bytes back).
+is shorter) by default, and that's all, for every row, always. A real
+LLM-generated one-or-two-sentence summary is available **on demand only**:
+click a row to open its full-text popup, then click "✨ Interpret and
+explain" to ask `prompt_insight.summarizer_service` (a reachable entry in
+`ollama.services`) for one, which replaces the stored summary in place
+once it returns (`POST /api/prompt_interpret/{row_id}`).
+
+This used to run automatically, as a background task, for every single
+mirrored prompt — found live that almost nobody actually reads most of
+these summaries, so that pool's hardware (point this at hardware that
+isn't part of your real inference pool if you have any — an otherwise-idle
+GPU, a CPU-only Ollama instance) was doing real, continuous inference work
+for summaries that mostly went unread. Pull beats push here: the button
+adds real latency per click (summarizer load + generate, and it's blocked
+while another interpretation is in flight — `SUMMARIZER_BUSY`, no queue,
+try again shortly if you see a 503), but it only runs when someone
+actually wants to read it. A summarizer that's unset, unreachable, or
+times out just means the button's result area shows an error — the
+row's own mechanical-fallback summary is untouched either way, nothing to
+roll back. Pointing the summarizer at the same pool being monitored means
+it competes with real inference for capacity and can time out under load
+(observed directly while building this: a real generate call to the busy
+production pool on this box timed out at 20s with zero bytes back) — same
+caution applies on-demand as it did when this ran automatically.
 
 Each row also gets real per-request TTFT/prefill_tps/decode_tps, attached
 asynchronously once the underlying request actually completes (see
@@ -606,6 +616,7 @@ this is a display/detection distinction only, the underlying `load_cycles` rows 
 | `GET /api/requested_models` | Every distinct model actually *requested* per service in a window (default 1h), with a count and whether it matches what's resident — the data source for the "Requested Models" dashboard panel and the `rejected_model_mismatch` pattern; catches wasted/rejected traffic that never shows up in `load_cycles` |
 | `GET /api/prompt_summaries` | Recent one-line prompt summaries (see [Prompt insight](#prompt-insight)) |
 | `GET /api/prompt_raw/{id}` | Real prompt text behind one summary, in-memory only (see [Prompt insight](#prompt-insight)) |
+| `POST /api/prompt_interpret/{id}` | On-demand LLM interpretation of one row, triggered by the dashboard's "Interpret and explain" button (see [Prompt insight](#prompt-insight)) |
 | `POST /api/prompt_mirror` | Reverse-proxy mirror target — not for direct use, see [Prompt insight](#prompt-insight) |
 | `GET /api/watchdog_actions` | Full audit trail of auto-restart attempts, run or suppressed (see [Watchdog](#watchdog)) |
 | `WS /ws` | Live updates (GPU samples, connections, lifecycle events, patterns) |

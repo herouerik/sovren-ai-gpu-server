@@ -173,6 +173,13 @@ table.data tr:hover td{background:var(--surf2)}
 .prompt-popup-close{cursor:pointer;color:var(--muted);padding:0 4px;font-size:11px}
 .prompt-popup-close:hover{color:var(--text)}
 .prompt-popup-body{font-size:10px;color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5}
+.prompt-popup-footer{margin-top:10px;padding-top:8px;border-top:1px solid var(--border)}
+.prompt-interpret-btn{font:inherit;font-size:9px;letter-spacing:.04em;background:var(--surf);color:var(--accent);border:1px solid var(--accent);border-radius:2px;padding:4px 10px;cursor:pointer}
+.prompt-interpret-btn:hover:not(:disabled){background:var(--accentA)}
+.prompt-interpret-btn:disabled{opacity:.6;cursor:default}
+.prompt-interpret-result{margin-top:8px;font-size:10px;line-height:1.5;white-space:pre-wrap}
+.prompt-interpret-result.ok{color:var(--text)}
+.prompt-interpret-result.err{color:var(--yellow)}
 
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 @media (max-width:900px){.two-col{grid-template-columns:1fr}}
@@ -301,6 +308,10 @@ canvas{max-width:100%}
       <span class="prompt-popup-close" onclick="closePromptPopup()" title="Close">✕</span>
     </div>
     <div class="prompt-popup-body" id="promptPopupBody"></div>
+    <div class="prompt-popup-footer">
+      <button class="prompt-interpret-btn" id="promptInterpretBtn" onclick="interpretPrompt()">✨ Interpret and explain</button>
+      <div class="prompt-interpret-result" id="promptInterpretResult"></div>
+    </div>
   </div>
 
 </div>
@@ -621,6 +632,7 @@ function fmtPromptMetricsTitle(p) {
 // text is cached server-side for every mirrored prompt regardless of
 // source (see storage.cache_raw_prompt), never written to data/monitor.db.
 let promptPopupOpenFor = null;  // row id currently pinned open, or null
+let promptPopupCurrent = null;  // {id, ts} for the open row -- interpretPrompt() reads this
 
 async function togglePromptPopup(el, id, ts, svc, model) {
   const popup = $('promptPopup');
@@ -642,6 +654,13 @@ async function togglePromptPopup(el, id, ts, svc, model) {
 
   $('promptPopupMeta').textContent = `${svc}${model ? ' · ' + model : ''} · ${fmtTime(ts)}`;
   $('promptPopupBody').textContent = text;
+  promptPopupCurrent = { id, ts };
+  const btn = $('promptInterpretBtn');
+  btn.disabled = false;
+  btn.textContent = '✨ Interpret and explain';
+  const result = $('promptInterpretResult');
+  result.textContent = '';
+  result.className = 'prompt-interpret-result';
   popup.hidden = false;
   promptPopupOpenFor = id;
 
@@ -654,6 +673,41 @@ async function togglePromptPopup(el, id, ts, svc, model) {
 function closePromptPopup() {
   $('promptPopup').hidden = true;
   promptPopupOpenFor = null;
+  promptPopupCurrent = null;
+}
+
+// On-demand only -- see src/main.py _run_summarizer: this used to run
+// automatically for every mirrored prompt (real GPU0 inference, almost
+// never actually read), now only when this button is clicked. Real
+// latency (summarizer load + generate) is the accepted tradeoff.
+async function interpretPrompt() {
+  if (!promptPopupCurrent) return;
+  const { id, ts } = promptPopupCurrent;
+  const btn = $('promptInterpretBtn');
+  const result = $('promptInterpretResult');
+  btn.disabled = true;
+  btn.textContent = 'Interpreting…';
+  result.textContent = '';
+  result.className = 'prompt-interpret-result';
+  try {
+    const r = await fetch(`/api/prompt_interpret/${id}?timestamp=${ts}`, { method: 'POST' });
+    const data = await r.json();
+    if (r.ok) {
+      result.textContent = data.summary;
+      result.className = 'prompt-interpret-result ok';
+      btn.textContent = '✨ Interpret and explain';
+    } else {
+      result.textContent = data.error || 'Failed to interpret.';
+      result.className = 'prompt-interpret-result err';
+      btn.textContent = '✨ Interpret and explain';
+    }
+  } catch (e) {
+    result.textContent = 'Failed to interpret.';
+    result.className = 'prompt-interpret-result err';
+    btn.textContent = '✨ Interpret and explain';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 document.addEventListener('click', (e) => {

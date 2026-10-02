@@ -972,18 +972,32 @@ def _looks_like_verbatim_echo(text: str, prompt_text: str) -> bool:
     return False
 
 
-async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
-    """Runs as a fire-and-forget background task -- never blocks the mirror
-    response. Failure (summarizer not running, timeout, bad/echoed output)
-    just means the mechanical placeholder ring_insert() already wrote stays
-    put; there's nothing to roll back."""
+class _SummarizerBusy(Exception):
+    pass
+
+
+class _SummarizerUnavailable(Exception):
+    pass
+
+
+async def _run_summarizer(prompt_text: str) -> Optional[str]:
+    """The actual LLM call, shared by on-demand interpretation
+    (/api/prompt_interpret) -- no longer run automatically per mirrored
+    prompt (see prompt_mirror()): every mirrored prompt used to fire this
+    as a background task unconditionally, which meant GPU0 (ollama-meta)
+    was doing real, continuous inference work for summaries almost nobody
+    actually read. Now purely pull, triggered by a dashboard click.
+    Raises _SummarizerUnavailable (not configured) or _SummarizerBusy
+    (already running one interpretation) rather than silently returning
+    None, since a user who clicked a button is owed a reason, not a
+    swallowed failure."""
     cfg = settings.prompt_insight
     summarizer = settings.get_ollama_service(cfg.summarizer_service) if cfg.summarizer_service else None
     if not summarizer:
-        return
+        raise _SummarizerUnavailable()
     global SUMMARIZER_BUSY
     if SUMMARIZER_BUSY:
-        return  # already working on another prompt -- skip, leave the mechanical fallback in place
+        raise _SummarizerBusy()
     instruction = (
         f"Summarize the following prompt in one or two plain sentences, at most "
         f"{cfg.fallback_max_chars} characters, describing what is being asked for. "
@@ -1009,12 +1023,9 @@ async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
         resp.raise_for_status()
         raw = resp.json().get("response", "")
         if _looks_like_verbatim_echo(raw, prompt_text):
-            return  # model echoed/continued the input -- leave the mechanical fallback in place
+            return None  # model echoed/continued the input -- nothing useful to show
         summary = _truncate_to_words(raw, cfg.fallback_max_words, cfg.fallback_max_chars)
-        if summary and summary != "(empty prompt)":
-            upgrade_ring_row("prompt_summaries", row_id, timestamp, {"summary": summary, "source": "llm"})
-    except Exception as e:
-        print(f"Prompt summarizer error: {e}")
+        return summary if summary and summary != "(empty prompt)" else None
     finally:
         SUMMARIZER_BUSY = False
 
@@ -1022,8 +1033,12 @@ async def _summarize_via_llm(row_id: int, timestamp: float, prompt_text: str):
 @app.post("/api/prompt_mirror")
 async def prompt_mirror(request: Request):
     """Receives a mirrored copy of a real request from the reverse proxy.
-    Always returns fast -- summarization (if configured) happens in a
-    background task, never blocking this response."""
+    Always returns fast. Every row gets the mechanical-truncation summary
+    only -- no automatic LLM call (see _run_summarizer / POST
+    /api/prompt_interpret/{row_id} for the on-demand version, triggered by
+    a dashboard click). Summarizing every mirrored prompt unconditionally
+    used to mean GPU0 (ollama-meta) ran real inference continuously for
+    summaries almost nobody read; pull beats push here."""
     if not settings.prompt_insight.enabled:
         return {"ok": True}
     try:
@@ -1051,9 +1066,6 @@ async def prompt_mirror(request: Request):
         "status": "pending",
     }, capacity=cfg.ring_capacity)
     cache_raw_prompt(row_id, timestamp, prompt_text)
-
-    if cfg.summarizer_service:
-        asyncio.create_task(_summarize_via_llm(row_id, timestamp, prompt_text))
 
     return {"ok": True}
 
@@ -1108,6 +1120,29 @@ async def get_prompt_raw(row_id: int, timestamp: float = Query(...)):
     if text is None:
         return JSONResponse({"error": "not available (evicted or predates last restart)"}, status_code=404)
     return {"text": text}
+
+
+@app.post("/api/prompt_interpret/{row_id}")
+async def interpret_prompt(row_id: int, timestamp: float = Query(...)):
+    """On-demand LLM interpretation of one Recent Prompts row, via GPU0's
+    summarizer (see _run_summarizer) -- replaces the old always-on
+    background summarization. Deliberately synchronous (the caller is a
+    button click expecting a result, not a fire-and-forget mirror
+    response): real latency here (summarizer load + generate) is the
+    accepted tradeoff for not running this on every mirrored prompt."""
+    text = get_raw_prompt(row_id, timestamp)
+    if text is None:
+        return JSONResponse({"error": "raw prompt not available (evicted or predates last restart)"}, status_code=404)
+    try:
+        summary = await _run_summarizer(text)
+    except _SummarizerUnavailable:
+        return JSONResponse({"error": "no summarizer configured (prompt_insight.summarizer_service)"}, status_code=503)
+    except _SummarizerBusy:
+        return JSONResponse({"error": "summarizer is busy with another interpretation, try again shortly"}, status_code=503)
+    if summary is None:
+        return JSONResponse({"error": "summarizer returned nothing usable"}, status_code=502)
+    upgrade_ring_row("prompt_summaries", row_id, timestamp, {"summary": summary, "source": "llm"})
+    return {"summary": summary}
 
 
 @app.websocket("/ws")
