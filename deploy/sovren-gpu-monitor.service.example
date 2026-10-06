@@ -1,0 +1,19 @@
+# Template: replace <user> and <repo_path>, then install as
+# /etc/systemd/system/sovren-gpu-monitor.service
+[Unit]
+Description=Sovren GPU Ollama Monitor (web dashboard, port 8082)
+After=network-online.target ollama-unified.service ollama-meta.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<user>
+WorkingDirectory=<repo_path>
+ExecStartPre=/bin/mkdir -p static data
+ExecStart=<repo_path>/.venv/bin/python -m uvicorn src.main:app --host 0.0.0.0 --port 8082
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

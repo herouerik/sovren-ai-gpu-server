@@ -1,0 +1,19 @@
+# Installs as /etc/systemd/system/nginx.service.d/wait-for-tailscale.conf
+# (replaces the earlier After=/Wants= only drop-in).
+#
+# tailscaled reports "active" before its address is assigned on tailscale0,
+# so ordering after it is not enough: nginx's config binds 100.x:443 and
+# fails at boot. Wait for an IPv4 address on tailscale0 first, then run the
+# same config test nginx's own unit does. The list is reset ("ExecStartPre=")
+# so these run in this order instead of after the base unit's nginx -t.
+[Unit]
+After=tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+ExecStartPre=
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip -4 addr show tailscale0 2>/dev/null | grep -q "inet " && exit 0; sleep 1; done; echo "tailscale0 has no IPv4 after 60s" >&2; exit 1'
+ExecStartPre=/bin/chmod 644 /etc/nginx/certs/brahma-key.pem
+ExecStartPre=/usr/sbin/nginx -t -q -g 'daemon on; master_process on;'
+Restart=on-failure
+RestartSec=5
