@@ -58,7 +58,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -209,7 +209,20 @@ async def log_capture_orchestrator():
                     if entry.method != "POST" or not entry.path.rstrip("/").endswith(_INFERENCE_ENDPOINT_SUFFIXES):
                         continue
                     status = "completed" if 200 <= entry.status < 400 else "failed"
-                    attach_prompt_status(svc.name, entry.timestamp, status, status_detail=f"HTTP {entry.status}")
+                    model = attach_prompt_status(svc.name, entry.timestamp, status, status_detail=f"HTTP {entry.status}")
+                    if entry.status == 403:
+                        # The ollama_gateway() access-control check (main.py) refused
+                        # this one before it ever reached Ollama -- surfaced as its
+                        # own `requests` row (not just a stuck-pending prompt row) so
+                        # _detect_remote_model_blocked() has something to find.
+                        req_info = {
+                            "timestamp": entry.timestamp, "service_name": svc.name,
+                            "endpoint": entry.path, "method": entry.method,
+                            "client_ip": entry.client_ip, "status_code": entry.status,
+                            "model": model, "error": "blocked: model not in remote_model_allowlist",
+                        }
+                        ring_insert("requests", req_info, capacity=settings.storage.raw_ring_capacity)
+                        await broadcast_ws({"type": "request", "data": req_info})
 
             for systemd_name, svc in service_lookup.items():
                 if not svc.enabled:
@@ -916,6 +929,83 @@ async def get_watchdog_actions(limit: int = Query(50, le=500)):
         "SELECT * FROM watchdog_actions ORDER BY timestamp DESC LIMIT ?", (limit,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# =============================================================================
+# OLLAMA GATEWAY — the one blocking path in this app
+# =============================================================================
+#
+# Everything else in this file is deliberately passive (see PROMPT INSIGHT
+# below): a mirrored copy this app can't affect real traffic with. This
+# endpoint is the opposite on purpose -- it's the actual reverse-proxy hop
+# for ollama-mirror.conf's `proxy_pass`, so it's in a position to refuse a
+# request before it reaches Ollama. That also means: if this app is down,
+# remote callers lose Ollama access entirely (nginx's `mirror` directive
+# can't enforce anything -- it fires a non-blocking copy and ignores the
+# response, so there was no way to do this without becoming a real hop).
+#
+# Enforcement is deliberately narrow: only requests from a non-loopback
+# client IP, and only on the `model` field of a JSON body, get checked
+# against access_control.remote_model_allowlist. A local (127.0.0.1/::1)
+# caller is never restricted. Everything else about the request (path,
+# method, headers, streaming body) is passed through unchanged.
+
+_HOP_BY_HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "upgrade", "content-length", "host"}
+
+
+def _local_ollama_upstream() -> str:
+    svc = settings.get_ollama_service("macbook-local")
+    port = svc.port if svc else 11435
+    return f"http://127.0.0.1:{port}"
+
+
+@app.api_route("/proxy/ollama/{path:path}", methods=["GET", "POST", "HEAD", "PUT", "DELETE", "PATCH"])
+async def ollama_gateway(path: str, request: Request):
+    client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else None)
+    is_remote = client_ip not in (None, "127.0.0.1", "::1")
+    body_bytes = await request.body()
+
+    if is_remote and body_bytes:
+        try:
+            model = json.loads(body_bytes).get("model")
+        except Exception:
+            model = None
+        if model and model not in settings.access_control.remote_model_allowlist:
+            return JSONResponse(
+                status_code=403,
+                content={"error": f"model '{model}' is not permitted for remote clients"},
+            )
+
+    upstream_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS}
+    client = httpx.AsyncClient(timeout=httpx.Timeout(3600.0))
+    upstream_req = client.build_request(
+        request.method,
+        f"{_local_ollama_upstream()}/{path}",
+        params=request.query_params,
+        content=body_bytes,
+        headers=upstream_headers,
+    )
+    try:
+        upstream_resp = await client.send(upstream_req, stream=True)
+    except httpx.ConnectError:
+        await client.aclose()
+        return JSONResponse(status_code=502, content={"error": "local Ollama is unreachable"})
+
+    async def _relay():
+        try:
+            async for chunk in upstream_resp.aiter_raw():
+                yield chunk
+        finally:
+            await upstream_resp.aclose()
+            await client.aclose()
+
+    response_headers = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS}
+    return StreamingResponse(
+        _relay(),
+        status_code=upstream_resp.status_code,
+        headers=response_headers,
+        media_type=upstream_resp.headers.get("content-type"),
+    )
 
 
 # =============================================================================

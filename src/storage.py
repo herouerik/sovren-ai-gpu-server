@@ -507,28 +507,34 @@ def attach_prompt_metrics(service_name: str, completed_at: float, metrics: Dict[
     db.commit()
 
 
-def attach_prompt_status(service_name: str, completed_at: float, status: str, status_detail: Optional[str] = None) -> None:
+def attach_prompt_status(service_name: str, completed_at: float, status: str, status_detail: Optional[str] = None) -> Optional[str]:
     """Same best-effort correlation as attach_prompt_metrics() (most recent
     still-pending row for this service), sourced from a reverse proxy's own
     access log instead of journald -- see AccessLogTailer. Matches on
     `status = 'pending'` rather than `ttft_ms IS NULL`, since on a platform
     with no journald ttft_ms can never be attached at all; without its own
     match column this would just keep re-matching the same already-settled
-    row forever."""
+    row forever.
+
+    Returns the matched row's `model` (or None if nothing matched) so a
+    caller logging a blocked/failed request into `requests` can tag it with
+    the model the client actually asked for, without a second query racing
+    against this one for the same row."""
     db = get_db()
     row = db.execute("""
-        SELECT id, timestamp FROM prompt_summaries
+        SELECT id, timestamp, model FROM prompt_summaries
         WHERE service_name = ? AND status = 'pending' AND timestamp <= ?
         ORDER BY timestamp DESC LIMIT 1
     """, (service_name, completed_at)).fetchone()
     if row is None:
-        return
+        return None
     latency_ms = (completed_at - row["timestamp"]) * 1000
     db.execute(
         "UPDATE prompt_summaries SET status = ?, status_detail = ?, latency_ms = ? WHERE id = ? AND timestamp = ?",
         (status, status_detail, latency_ms, row["id"], row["timestamp"]),
     )
     db.commit()
+    return row["model"]
 
 
 def day_bucket_insert(table: str, data: Dict[str, Any], timestamp: float, retention_days: int) -> int:

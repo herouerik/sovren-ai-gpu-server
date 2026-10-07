@@ -38,6 +38,7 @@ class PatternAnalyzer:
         patterns.extend(await self._detect_ctx_churn())
         patterns.extend(await self._detect_model_churn())
         patterns.extend(await self._detect_rejected_model_mismatch())
+        patterns.extend(await self._detect_remote_model_blocked())
         patterns.extend(await self._detect_near_zero_keep_alive())
         # Connection-based
         patterns.extend(await self._detect_connection_pileup())
@@ -352,6 +353,35 @@ class PatternAnalyzer:
                 related_request_id=row["id"],
                 details={"service": row["service_name"], "client_ip": row["client_ip"],
                           "status_code": row["status_code"], "blocked": blocked},
+            ))
+        return patterns
+
+    async def _detect_remote_model_blocked(self) -> List[Pattern]:
+        """A remote caller's inference request was refused by the ollama
+        gateway's access_control.remote_model_allowlist (see main.py
+        ollama_gateway()) before it ever reached Ollama. Mirrors
+        _detect_delete_attempts' shape, but for model gating instead of the
+        DELETE guard -- `method != 'DELETE'` keeps the two from double-
+        counting the same row."""
+        cutoff = time.time() - 3600
+        rows = execute("""
+            SELECT id, service_name, client_ip, model, endpoint, timestamp
+            FROM requests
+            WHERE timestamp > ? AND status_code = 403 AND method != 'DELETE'
+            ORDER BY timestamp DESC
+        """, (cutoff,)).fetchall()
+
+        patterns = []
+        for row in rows:
+            patterns.append(Pattern(
+                timestamp=row["timestamp"],
+                pattern_type="remote_model_blocked",
+                severity="warning",
+                description=f"Blocked remote request from {row['client_ip']} on {row['service_name']} — "
+                            f"asked for '{row['model'] or 'unknown model'}', not in remote allowlist",
+                related_request_id=row["id"],
+                details={"service": row["service_name"], "client_ip": row["client_ip"],
+                          "model": row["model"], "endpoint": row["endpoint"]},
             ))
         return patterns
 

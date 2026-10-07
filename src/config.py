@@ -180,6 +180,17 @@ class PromptInsightConfig(BaseSettings):
     model_config = SettingsConfigDict(extra="allow")
 
 
+class AccessControlConfig(BaseSettings):
+    # Enforced only against the blocking gateway (/proxy/ollama/*, see
+    # main.py ollama_gateway()) -- /api/prompt_mirror stays passive and
+    # can't block anything (mirror subrequests are fire-and-forget).
+    # Empty list = no remote caller may request any model at all; a
+    # request from 127.0.0.1/::1 is never restricted by this.
+    remote_model_allowlist: List[str] = Field(default_factory=list)
+
+    model_config = SettingsConfigDict(extra="allow")
+
+
 class ServerConfig(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
@@ -207,6 +218,7 @@ class Settings(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
     prompt_insight: PromptInsightConfig = Field(default_factory=PromptInsightConfig)
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
+    access_control: AccessControlConfig = Field(default_factory=AccessControlConfig)
 
     model_config = SettingsConfigDict(extra="allow")
 
