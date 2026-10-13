@@ -208,21 +208,17 @@ async def log_capture_orchestrator():
                 for entry in entries:
                     if entry.method != "POST" or not entry.path.rstrip("/").endswith(_INFERENCE_ENDPOINT_SUFFIXES):
                         continue
-                    status = "completed" if 200 <= entry.status < 400 else "failed"
-                    model = attach_prompt_status(svc.name, entry.timestamp, status, status_detail=f"HTTP {entry.status}")
                     if entry.status == 403:
-                        # The ollama_gateway() access-control check (main.py) refused
-                        # this one before it ever reached Ollama -- surfaced as its
-                        # own `requests` row (not just a stuck-pending prompt row) so
-                        # _detect_remote_model_blocked() has something to find.
-                        req_info = {
-                            "timestamp": entry.timestamp, "service_name": svc.name,
-                            "endpoint": entry.path, "method": entry.method,
-                            "client_ip": entry.client_ip, "status_code": entry.status,
-                            "model": model, "error": "blocked: model not in remote_model_allowlist",
-                        }
-                        ring_insert("requests", req_info, capacity=settings.storage.raw_ring_capacity)
-                        await broadcast_ws({"type": "request", "data": req_info})
+                        # ollama_gateway() (main.py) already logged this one
+                        # directly, with the real parsed model, at the moment it
+                        # refused the request -- it never reached Ollama, so there
+                        # is no pending prompt_summaries row to correlate this
+                        # access-log line against. Calling attach_prompt_status
+                        # here would just misattribute it to whatever unrelated
+                        # local prompt happened to be pending nearest in time.
+                        continue
+                    status = "completed" if 200 <= entry.status < 400 else "failed"
+                    attach_prompt_status(svc.name, entry.timestamp, status, status_detail=f"HTTP {entry.status}")
 
             for systemd_name, svc in service_lookup.items():
                 if not svc.enabled:
@@ -971,6 +967,22 @@ async def ollama_gateway(path: str, request: Request):
         except Exception:
             model = None
         if model and model not in settings.access_control.remote_model_allowlist:
+            # Log the actual parsed model directly, right here -- this request
+            # never reaches Ollama, so there is no later access-log line or
+            # pending prompt_summaries row to correlate it against. (A previous
+            # version relied on log_capture_orchestrator's nginx-access-log 403
+            # handling for this, which has no request body to read and so
+            # guessed the model from whatever local prompt happened to be
+            # pending nearest in time -- misattributing it to unrelated, often
+            # allowed, local traffic.)
+            req_info = {
+                "timestamp": time.time(), "service_name": "macbook-local",
+                "endpoint": f"/{path}", "method": request.method,
+                "client_ip": client_ip, "status_code": 403,
+                "model": model, "error": "blocked: model not in remote_model_allowlist",
+            }
+            ring_insert("requests", req_info, capacity=settings.storage.raw_ring_capacity)
+            await broadcast_ws({"type": "request", "data": req_info})
             return JSONResponse(
                 status_code=403,
                 content={"error": f"model '{model}' is not permitted for remote clients"},
