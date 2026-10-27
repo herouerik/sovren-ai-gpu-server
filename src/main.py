@@ -315,6 +315,19 @@ async def watchdog_orchestrator():
         await asyncio.sleep(_WATCHDOG_POLL_SECONDS)
 
 
+async def retention_orchestrator():
+    """Apply the age limit (src/retention.py) every retention.interval_hours; does nothing when max_age_days is 0."""
+    from src import retention
+    while True:
+        if settings.retention.max_age_days > 0:
+            try:
+                res = await asyncio.to_thread(retention.run_once, settings)
+                print(f"Retention: rows {res.get('rows')}, files removed {len(res.get('files', []))}")
+            except Exception as e:  # never let cleanup take the monitor down
+                print(f"Retention error: {e}")
+        await asyncio.sleep(max(settings.retention.interval_hours, 0.1) * 3600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -322,6 +335,7 @@ async def lifespan(app: FastAPI):
     collector_task = asyncio.create_task(collector_orchestrator())
     log_task = asyncio.create_task(log_capture_orchestrator())
     watchdog_task = asyncio.create_task(watchdog_orchestrator())
+    retention_task = asyncio.create_task(retention_orchestrator())
     try:
         yield
     finally:
@@ -330,6 +344,7 @@ async def lifespan(app: FastAPI):
         collector_task.cancel()
         log_task.cancel()
         watchdog_task.cancel()
+        retention_task.cancel()
         try:
             await collector_task
         except asyncio.CancelledError:
@@ -340,6 +355,10 @@ async def lifespan(app: FastAPI):
             pass
         try:
             await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await retention_task
         except asyncio.CancelledError:
             pass
         gpu_collector.cleanup()

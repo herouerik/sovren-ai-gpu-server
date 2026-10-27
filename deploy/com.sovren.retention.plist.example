@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS launchd job: apply the retention (src/retention.py) every day at 03:15, independent of the monitor.
+     Install: edit the two paths, copy to ~/Library/LaunchAgents/com.sovren.retention.plist, then
+     launchctl load ~/Library/LaunchAgents/com.sovren.retention.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.sovren.retention</string>
+  <key>WorkingDirectory</key><string>/Users/erik/sovren-ai-gpu-server</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/erik/sovren-ai-gpu-server/venv/bin/python3</string>
+    <string>-m</string><string>src.retention</string>
+  </array>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>15</integer></dict>
+  <key>StandardOutPath</key><string>/tmp/sovren-retention.out</string>
+  <key>StandardErrorPath</key><string>/tmp/sovren-retention.err</string>
+</dict></plist>

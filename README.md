@@ -389,6 +389,20 @@ to "only the summary is ever kept" — worth knowing if you're deploying
 this somewhere the process's own memory needs to be trusted, not just the
 database file.
 
+### Age-based retention and log cleansing
+
+The tables are bounded by count, not age, so on a quiet machine a prompt summary can outlive its usefulness by months. For a shared or work machine, set an age limit:
+
+```yaml
+retention:
+  max_age_days: 14          # 0 = off
+  interval_hours: 6
+  log_dirs: ["/opt/homebrew/var/log/nginx", "~/.ollama/logs"]   # rotated logs only
+```
+
+With it on, the monitor deletes `prompt_summaries`, `requests` and `task_samples` rows older than the limit (with `secure_delete` and a WAL truncate so the text does not linger in the file) and deletes old regular files matching `log_patterns` directly inside `log_dirs` (no recursion, no symlinks). An active log is never deleted by age: rotate it (`deploy/newsyslog-sovren.conf.example`) so old data becomes a rotated file. To run it outside the monitor: `python3 -m src.retention [--dry-run]`, or schedule it with `deploy/com.sovren.retention.plist.example` (launchd). Tests: `tests/test_retention.py`.
+
+
 ## Watchdog
 
 Off by default (`watchdog.enabled: false`) — this is the one feature in

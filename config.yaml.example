@@ -101,3 +101,16 @@ prompt_insight:
   fallback_max_words: 40
   fallback_max_chars: 200
   ring_capacity: 100
+
+# Age-based retention and cleansing (src/retention.py). Prompt summaries live in a ring
+# bounded by COUNT, which on a quiet machine can keep them for months; this adds an AGE limit.
+# 0 = off. On a shared / work machine set 14 (drops everything older than 14 days).
+retention:
+  max_age_days: 0
+  interval_hours: 6
+  # Directories whose OLD files are deleted (rotated logs only; active logs need rotation, see
+  # deploy/newsyslog-sovren.conf.example). Regular files directly inside, matching log_patterns.
+  log_dirs: []
+  #  - "/opt/homebrew/var/log/nginx"
+  #  - "~/.ollama/logs"
+  log_patterns: ["*.log.*", "*.gz", "*.log.[0-9]*"]

@@ -1,0 +1,12 @@
+# macOS: rotate the nginx and Ollama logs daily and keep 14 rotated copies, so that
+# `retention.log_dirs` + `retention.max_age_days: 14` (src/retention.py) can delete the old ones.
+# Install: sudo cp this file to /etc/newsyslog.d/sovren.conf (edit the paths first). macOS runs
+# newsyslog hourly. Fields: logfilename  [owner:group]  mode  count  size(KB)  when  flags
+# Flags: N = no signal sent, Z = gzip rotated files, J = bzip2 (use one). `$D0` = daily at midnight.
+/opt/homebrew/var/log/nginx/access.log   erik:staff  644  14  *  $D0  GN
+/opt/homebrew/var/log/nginx/error.log    erik:staff  644  14  *  $D0  GN
+# Ollama.app log (the path varies by version; check ~/.ollama/logs):
+/Users/erik/.ollama/logs/server.log      erik:staff  644  14  *  $D0  GN
+# nginx keeps writing to the renamed file until it is told to reopen: add a daily
+#   nginx -s reopen
+# (launchd job or cron) shortly after midnight, or use the nginx.pid signal in your install.

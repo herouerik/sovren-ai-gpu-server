@@ -191,6 +191,20 @@ class AccessControlConfig(BaseSettings):
     model_config = SettingsConfigDict(extra="allow")
 
 
+class RetentionConfig(BaseSettings):
+    # Age limit for anything that can reveal what was asked (see src/retention.py).
+    # 0 = off (the default for new installs); set 14 to drop everything older than 14 days.
+    max_age_days: float = 0
+    # Run inside the monitor every N hours when max_age_days > 0 (the CLI works regardless).
+    interval_hours: float = 6
+    # Directories whose OLD files are deleted (rotated nginx / Ollama logs, ...). Only regular
+    # files directly inside these directories that match log_patterns; no recursion, no symlinks.
+    log_dirs: List[str] = Field(default_factory=list)
+    log_patterns: List[str] = Field(default_factory=lambda: ["*.log.*", "*.gz", "*.log.[0-9]*"])
+
+    model_config = SettingsConfigDict(extra="allow")
+
+
 class ServerConfig(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
@@ -219,6 +233,7 @@ class Settings(BaseSettings):
     prompt_insight: PromptInsightConfig = Field(default_factory=PromptInsightConfig)
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
     access_control: AccessControlConfig = Field(default_factory=AccessControlConfig)
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
 
     model_config = SettingsConfigDict(extra="allow")
 
