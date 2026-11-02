@@ -811,21 +811,21 @@ async def get_health_status():
             status = "IDLE"
             status_reason = None
 
+        # Idle means /api/ps shows nothing resident: don't fall back to the last
+        # load cycle, whose model/ctx/timing describe a model that is gone
+        # (and whose model can be a raw sha256 blob name).
         loaded_since = None
-        if latest_cycle and latest_cycle["outcome"] == "success" and not latest_cycle["evicted_ts"]:
+        if resident_model and latest_cycle and latest_cycle["outcome"] == "success" and not latest_cycle["evicted_ts"]:
             loaded_since = latest_cycle["load_completed_ts"]
 
         result[svc.name] = {
             "enabled": True,
             "status": status,
             "status_reason": status_reason,
-            "model": (resident_model["name"] if resident_model else None) or
-                     (latest_cycle["model"] if latest_cycle else None),
-            "ctx": (resident_model.get("context_length") if resident_model else None) or
-                   (latest_cycle["ctx_requested"] if latest_cycle else None),
+            "model": resident_model["name"] if resident_model else None,
+            "ctx": resident_model.get("context_length") if resident_model else None,
             "loaded_since": loaded_since,
-            "keep_alive_expires_at": resident_expires_at or
-                                      (latest_cycle["keep_alive_expires_at"] if latest_cycle else None),
+            "keep_alive_expires_at": resident_expires_at,
             "reload_count_5m": reload_count_5m,
             "distinct_ctx_15m": distinct_ctx_15m,
             "distinct_model_15m": distinct_model_15m,
