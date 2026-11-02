@@ -959,13 +959,28 @@ async def get_watchdog_actions(limit: int = Query(50, le=500)):
 # can't enforce anything -- it fires a non-blocking copy and ignores the
 # response, so there was no way to do this without becoming a real hop).
 #
-# Enforcement is deliberately narrow: only requests from a non-loopback
-# client IP, and only on the `model` field of a JSON body, get checked
-# against access_control.remote_model_allowlist. A local (127.0.0.1/::1)
-# caller is never restricted. Everything else about the request (path,
-# method, headers, streaming body) is passed through unchanged.
+# Two independent checks happen here, both keyed off the `model` field of a
+# JSON body:
+#   - access_control.remote_model_allowlist: only requests from a non-loopback
+#     client IP are checked against this; a local (127.0.0.1/::1) caller is
+#     never restricted by it. This is about WHO may ask for WHAT.
+#   - access_control.single_model_mode / min_model_switch_interval_hours:
+#     applies to every caller alike, local or remote. This is a resource
+#     throttle (this box can't hold multiple models' weights in RAM at once),
+#     not an access restriction, so it doesn't care who's asking.
+# Everything else about the request (path, method, headers, streaming body)
+# is passed through unchanged. GET /proxy/model-status lets a caller check
+# the currently-loaded model (and, if remote, the allowlist) before firing a
+# real request, instead of guessing and getting a 403/429.
 
 _HOP_BY_HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "upgrade", "content-length", "host"}
+
+# Tracks whatever model the single-model-mode throttle below last allowed
+# through -- in-process only, not persisted. Reset to "no current model" on
+# every monitor restart; that just means the next request is a free switch,
+# matching the fact that a restarted Ollama has nothing resident either.
+_model_switch_lock = asyncio.Lock()
+_model_switch_state: Dict[str, Any] = {"current_model": None, "last_switch_at": 0.0}
 
 
 def _local_ollama_upstream() -> str:
@@ -974,38 +989,126 @@ def _local_ollama_upstream() -> str:
     return f"http://127.0.0.1:{port}"
 
 
+async def _model_switch_block_info(model: Optional[str]) -> Optional[Dict[str, Any]]:
+    """None = request may proceed (and `current_model` is updated if this is
+    the first request, or a request for the already-loaded model). A dict
+    means it's blocked -- some other model is loaded and the configured
+    cooldown since the last switch hasn't elapsed yet."""
+    cfg = settings.access_control
+    if not model or not cfg.single_model_mode or cfg.min_model_switch_interval_hours <= 0:
+        return None
+    async with _model_switch_lock:
+        current = _model_switch_state["current_model"]
+        if current is None or current == model:
+            _model_switch_state["current_model"] = model
+            if current is None:
+                # First request this process has seen -- this model becomes
+                # "loaded" right now, so the cooldown for switching AWAY from
+                # it starts counting from here, not from the epoch.
+                _model_switch_state["last_switch_at"] = time.time()
+            return None
+        min_interval_seconds = cfg.min_model_switch_interval_hours * 3600
+        elapsed = time.time() - _model_switch_state["last_switch_at"]
+        if elapsed < min_interval_seconds:
+            return {
+                "current_model": current,
+                "requested_model": model,
+                "retry_after_seconds": int(min_interval_seconds - elapsed),
+            }
+        _model_switch_state["current_model"] = model
+        _model_switch_state["last_switch_at"] = time.time()
+        return None
+
+
+@app.get("/proxy/model-status")
+async def ollama_model_status(request: Request):
+    """Lets any caller -- before firing a real generate/chat request -- check
+    which model is currently loaded and (for a remote caller) the allowlist
+    it's restricted to, so it can retry with a model that will actually be
+    accepted instead of guessing."""
+    client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else None)
+    is_remote = client_ip not in (None, "127.0.0.1", "::1")
+    cfg = settings.access_control
+    current = _model_switch_state["current_model"]
+    switch_allowed_in_seconds = 0
+    if cfg.single_model_mode and current is not None:
+        min_interval_seconds = cfg.min_model_switch_interval_hours * 3600
+        elapsed = time.time() - _model_switch_state["last_switch_at"]
+        switch_allowed_in_seconds = max(0, int(min_interval_seconds - elapsed))
+    payload: Dict[str, Any] = {
+        "current_model": current,
+        "single_model_mode": cfg.single_model_mode,
+        "min_model_switch_interval_hours": cfg.min_model_switch_interval_hours,
+        "switch_allowed_in_seconds": switch_allowed_in_seconds,
+    }
+    if is_remote:
+        payload["remote_model_allowlist"] = cfg.remote_model_allowlist
+    return JSONResponse(content=payload)
+
+
 @app.api_route("/proxy/ollama/{path:path}", methods=["GET", "POST", "HEAD", "PUT", "DELETE", "PATCH"])
 async def ollama_gateway(path: str, request: Request):
     client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else None)
     is_remote = client_ip not in (None, "127.0.0.1", "::1")
     body_bytes = await request.body()
 
-    if is_remote and body_bytes:
+    model = None
+    if body_bytes:
         try:
             model = json.loads(body_bytes).get("model")
         except Exception:
             model = None
-        if model and model not in settings.access_control.remote_model_allowlist:
-            # Log the actual parsed model directly, right here -- this request
-            # never reaches Ollama, so there is no later access-log line or
-            # pending prompt_summaries row to correlate it against. (A previous
-            # version relied on log_capture_orchestrator's nginx-access-log 403
-            # handling for this, which has no request body to read and so
-            # guessed the model from whatever local prompt happened to be
-            # pending nearest in time -- misattributing it to unrelated, often
-            # allowed, local traffic.)
-            req_info = {
-                "timestamp": time.time(), "service_name": "macbook-local",
-                "endpoint": f"/{path}", "method": request.method,
-                "client_ip": client_ip, "status_code": 403,
-                "model": model, "error": "blocked: model not in remote_model_allowlist",
-            }
-            ring_insert("requests", req_info, capacity=settings.storage.raw_ring_capacity)
-            await broadcast_ws({"type": "request", "data": req_info})
-            return JSONResponse(
-                status_code=403,
-                content={"error": f"model '{model}' is not permitted for remote clients"},
-            )
+
+    if is_remote and model and model not in settings.access_control.remote_model_allowlist:
+        # Log the actual parsed model directly, right here -- this request
+        # never reaches Ollama, so there is no later access-log line or
+        # pending prompt_summaries row to correlate it against. (A previous
+        # version relied on log_capture_orchestrator's nginx-access-log 403
+        # handling for this, which has no request body to read and so
+        # guessed the model from whatever local prompt happened to be
+        # pending nearest in time -- misattributing it to unrelated, often
+        # allowed, local traffic.)
+        req_info = {
+            "timestamp": time.time(), "service_name": "macbook-local",
+            "endpoint": f"/{path}", "method": request.method,
+            "client_ip": client_ip, "status_code": 403,
+            "model": model, "error": "blocked: model not in remote_model_allowlist",
+        }
+        ring_insert("requests", req_info, capacity=settings.storage.raw_ring_capacity)
+        await broadcast_ws({"type": "request", "data": req_info})
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": f"model '{model}' is not permitted for remote clients",
+                "remote_model_allowlist": settings.access_control.remote_model_allowlist,
+            },
+        )
+
+    switch_block = await _model_switch_block_info(model)
+    if switch_block is not None:
+        req_info = {
+            "timestamp": time.time(), "service_name": "macbook-local",
+            "endpoint": f"/{path}", "method": request.method,
+            "client_ip": client_ip, "status_code": 429,
+            "model": model, "error": "blocked: model switch cooldown active",
+        }
+        ring_insert("requests", req_info, capacity=settings.storage.raw_ring_capacity)
+        await broadcast_ws({"type": "request", "data": req_info})
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(switch_block["retry_after_seconds"])},
+            content={
+                "error": (
+                    f"model switch blocked: '{switch_block['current_model']}' is "
+                    f"currently loaded; retry with that model, or wait "
+                    f"{switch_block['retry_after_seconds']}s to switch to "
+                    f"'{switch_block['requested_model']}'"
+                ),
+                "current_model": switch_block["current_model"],
+                "requested_model": switch_block["requested_model"],
+                "retry_after_seconds": switch_block["retry_after_seconds"],
+            },
+        )
 
     upstream_headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS}
     client = httpx.AsyncClient(timeout=httpx.Timeout(3600.0))

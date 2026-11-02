@@ -188,6 +188,16 @@ class AccessControlConfig(BaseSettings):
     # request from 127.0.0.1/::1 is never restricted by this.
     remote_model_allowlist: List[str] = Field(default_factory=list)
 
+    # Resource-protection throttle, NOT an access-control restriction --
+    # applies to every caller (local and remote) alike, since it exists to
+    # stop a RAM-constrained box from thrashing between model weights, not
+    # to gate who may ask for what. Off by default (false / 0).
+    single_model_mode: bool = False
+    # Minimum time between loading a DIFFERENT model than whatever is
+    # currently tracked as loaded. 0 (with single_model_mode: false) means
+    # no throttle at all.
+    min_model_switch_interval_hours: float = 0
+
     model_config = SettingsConfigDict(extra="allow")
 
 
