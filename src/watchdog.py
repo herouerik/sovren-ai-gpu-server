@@ -114,6 +114,43 @@ def _last_restart_attempt_ts(service_name: str) -> Optional[float]:
     return row["t"] if row and row["t"] is not None else None
 
 
+def _stalled_since(service_name: str, now: float, window: float) -> Optional[float]:
+    """Arrival time of the oldest real request that has been waiting at
+    least `window` seconds with no llama-server progress and no model load
+    since it arrived -- or None if the service isn't stalled.
+
+    Judges requests by how long they've been waiting, not by how much
+    traffic arrived recently: the earlier rule ("any traffic in the last
+    window AND no progress in the last window") fired on the first request
+    to arrive after a quiet period, even if the server had only just begun
+    a legitimate model load (see 2026-10-06, restart killed a load ~40s in).
+    A load is activity too, so a load started after a request arrived
+    clears it.
+    """
+    progress = last_progress_ts(service_name)
+    since = progress if progress is not None else 0.0
+    row = execute(
+        "SELECT MIN(timestamp) AS t FROM prompt_summaries WHERE service_name = ? AND timestamp > ?",
+        (service_name, since),
+    ).fetchone()
+    oldest = row["t"] if row else None
+    if oldest is None or now - oldest < window:
+        return None
+    recent = execute(
+        "SELECT 1 FROM prompt_summaries WHERE service_name = ? AND timestamp > ? LIMIT 1",
+        (service_name, now - window),
+    ).fetchone()
+    if recent is None:
+        return None
+    loading = execute(
+        "SELECT 1 FROM load_cycles WHERE service_name = ? AND (start_ts >= ? OR (outcome = 'pending' AND start_ts >= ?)) LIMIT 1",
+        (service_name, oldest, now - window),
+    ).fetchone()
+    if loading is not None:
+        return None
+    return oldest
+
+
 async def check_and_remediate_wedged_services() -> List[Pattern]:
     cfg = settings.watchdog
     if not cfg.enabled:
@@ -147,9 +184,8 @@ async def check_and_remediate_wedged_services() -> List[Pattern]:
         if total < cfg.min_real_requests_in_window:
             continue  # not enough real traffic in the window to judge either way
 
-        progress = last_progress_ts(svc.name)
-        if progress is not None and progress > window_cutoff:
-            continue  # real progress within the window -- healthy, or legitimately slow (Sep 22/23 case)
+        if _stalled_since(svc.name, now, cfg.wedge_window_seconds) is None:
+            continue  # no request has been waiting a full window without progress or a load
 
         # Wedge condition met: real traffic arrived, but llama-server
         # logged zero real progress for the entire window.
