@@ -114,3 +114,23 @@ retention:
   #  - "/opt/homebrew/var/log/nginx"
   #  - "~/.ollama/logs"
   log_patterns: ["*.log.*", "*.gz", "*.log.[0-9]*"]
+
+# Enforced by the blocking gateway at /proxy/ollama/* (see src/main.py ollama_gateway()) --
+# nginx's ollama-mirror.conf must proxy_pass there instead of straight to Ollama's real port
+# for any of this to apply.
+access_control:
+  # WHO may ask for WHAT: only checked against requests from a non-loopback client IP. A
+  # request from 127.0.0.1/::1 is never restricted. Empty = no remote caller may request any
+  # model. A blocked remote request gets a 403 (with this list in the body) before it ever
+  # reaches Ollama.
+  remote_model_allowlist: []
+  #  - "qwen3.6:35b-mlx"
+
+  # Resource throttle, not access control -- applies to EVERY caller (local and remote alike).
+  # Useful on a box that can't keep two models' weights resident in RAM without thrashing.
+  # When on, a request naming a DIFFERENT model than whichever one the gateway last allowed
+  # through gets a 429 (with Retry-After) until this many hours have passed since that switch.
+  # GET /proxy/model-status reports the current model and remaining cooldown, so a client can
+  # retry with the right model instead of guessing. Off by default (false / 0).
+  single_model_mode: false
+  min_model_switch_interval_hours: 0
