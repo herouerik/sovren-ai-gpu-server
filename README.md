@@ -28,6 +28,11 @@ whether the box is actually healthy right now — not just a metrics dump.
   asynchronously once each request actually completes
 - **Dashboard**: single-page, health-first layout — a hero status card, a color-coded
   load-cycle timeline, a GPU hardware checklist, live compute strip, and alerts
+- **Ollama gateway and access control** *(opt-in, see [Ollama gateway and access
+  control](#ollama-gateway-and-access-control))*: an optional blocking reverse-proxy
+  hop that can restrict which models a remote caller may request, and/or throttle how
+  often the resident model may be switched at all — useful on hardware that can't hold
+  more than one model's weights in memory at once
 
 ## Architecture
 
@@ -402,6 +407,36 @@ retention:
 
 With it on, the monitor deletes `prompt_summaries`, `requests` and `task_samples` rows older than the limit (with `secure_delete` and a WAL truncate so the text does not linger in the file) and deletes old regular files matching `log_patterns` directly inside `log_dirs` (no recursion, no symlinks). An active log is never deleted by age: rotate it (`deploy/newsyslog-sovren.conf.example`) so old data becomes a rotated file. To run it outside the monitor: `python3 -m src.retention [--dry-run]`, or schedule it with `deploy/com.sovren.retention.plist.example` (launchd). Tests: `tests/test_retention.py`.
 
+### Ollama gateway and access control
+
+`ollama.services[].public_port`, if set, implies a reverse proxy sits in front of Ollama's real (internal-only) port — the typical shape is a plain mirror/reverse-proxy tier forwarding the public port to Ollama's loopback-only bind. For that setup to actually *enforce* anything rather than just observe, point the proxy's `proxy_pass` (or equivalent) at this app's own gateway instead of straight at Ollama:
+
+```
+GET/POST/... http://<monitor-host>:<monitor-port>/proxy/ollama/{path}
+```
+
+`ollama_gateway()` (`src/main.py`) is the one real blocking hop in this app — everything else here is passive observation. It forwards every request to the local Ollama instance unchanged, except for two independent, config-driven checks against the `model` field of a JSON body:
+
+```yaml
+access_control:
+  # WHO may ask for WHAT. Only enforced against a non-loopback client IP (a
+  # 127.0.0.1/::1 caller is never restricted). Empty = no remote caller may
+  # request any model. A blocked request gets 403 before it reaches Ollama,
+  # with this list in the response body so the caller can retry correctly.
+  remote_model_allowlist: []
+
+  # A resource throttle, not access control -- applies to EVERY caller alike,
+  # local or remote. Useful when the host can't keep more than one model's
+  # weights resident without thrashing (e.g. a single unified-memory pool).
+  # When on, a request naming a DIFFERENT model than whichever one the
+  # gateway last allowed through gets 429 (+ Retry-After) until this many
+  # hours have passed since that switch. Off by default.
+  single_model_mode: false
+  min_model_switch_interval_hours: 0
+```
+
+`GET /proxy/model-status` lets any caller check the currently-loaded model (and, if it's a remote caller, the allowlist) before firing a real request — useful for a client that wants to retry with an accepted model instead of guessing after a 403/429. The switch-cooldown state is tracked in process memory only; it resets to "no current model" (a free first pick) on every monitor restart.
+
 
 ## Watchdog
 
@@ -641,6 +676,8 @@ this is a display/detection distinction only, the underlying `load_cycles` rows 
 | `POST /api/prompt_interpret/{id}` | On-demand LLM interpretation of one row, triggered by the dashboard's "Interpret and explain" button (see [Prompt insight](#prompt-insight)) |
 | `POST /api/prompt_mirror` | Reverse-proxy mirror target — not for direct use, see [Prompt insight](#prompt-insight) |
 | `GET /api/watchdog_actions` | Full audit trail of auto-restart attempts, run or suppressed (see [Watchdog](#watchdog)) |
+| `ANY /proxy/ollama/{path}` | Blocking reverse-proxy hop to the local Ollama instance, enforcing `access_control` (see [Ollama gateway and access control](#ollama-gateway-and-access-control)) |
+| `GET /proxy/model-status` | Currently-loaded model, switch-cooldown state, and (for a remote caller) the allowlist — see [Ollama gateway and access control](#ollama-gateway-and-access-control) |
 | `WS /ws` | Live updates (GPU samples, connections, lifecycle events, patterns) |
 
 ## Dashboard
