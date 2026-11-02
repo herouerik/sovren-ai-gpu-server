@@ -1,0 +1,67 @@
+# Variant of nginx-ollama.conf.example that sends public-port traffic through the monitor's
+# blocking gateway (src/main.py ollama_gateway()) instead of straight to Ollama, so
+# access_control.remote_model_allowlist and single_model_mode / min_model_switch_interval_hours
+# are enforced. Requires access_control.gateway_service in config.yaml to name the pool behind
+# this port (here "gpu-unified"), otherwise the gateway forwards to the wrong Ollama.
+#
+# Trade-off: the monitor becomes a hard hop. If sovren-gpu-monitor is down, public-port clients
+# get 502 instead of reaching Ollama. The mirror still feeds the Recent Prompts panel; it is
+# kept because the gateway does not record prompt summaries itself.
+#
+# Install over the existing sites-enabled file, then `sudo nginx -t && sudo systemctl reload nginx`.
+# Roll back by restoring the previous file (proxy_pass back to http://127.0.0.1:18434).
+
+server {
+    listen 11434;
+    listen [::]:11434;
+
+    location = /v1/chat/completions {
+        if ($request_method = DELETE) {
+            return 403 "deletes disabled on this endpoint\n";
+        }
+        limit_req zone=chat_completions burst=3 nodelay;
+        limit_req_status 429;
+        mirror /mirror-to-monitor;
+        mirror_request_body on;
+        proxy_pass http://127.0.0.1:8082/proxy/ollama/v1/chat/completions;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+        client_max_body_size 0;
+    }
+
+    # Lets clients see the loaded model and remaining switch cooldown before sending a request.
+    location = /proxy/model-status {
+        proxy_pass http://127.0.0.1:8082/proxy/model-status;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location / {
+        if ($request_method = DELETE) {
+            return 403 "deletes disabled on this endpoint\n";
+        }
+        mirror /mirror-to-monitor;
+        mirror_request_body on;
+        proxy_pass http://127.0.0.1:8082/proxy/ollama/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+        client_max_body_size 0;
+    }
+
+    location = /mirror-to-monitor {
+        internal;
+        proxy_pass http://127.0.0.1:8082/api/prompt_mirror;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Service-Name "gpu-unified";
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
