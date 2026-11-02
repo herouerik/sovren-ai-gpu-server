@@ -984,7 +984,7 @@ _model_switch_state: Dict[str, Any] = {"current_model": None, "last_switch_at": 
 
 
 def _local_ollama_upstream() -> str:
-    svc = settings.get_ollama_service("macbook-local")
+    svc = settings.get_ollama_service(settings.access_control.gateway_service)
     port = svc.port if svc else 11435
     return f"http://127.0.0.1:{port}"
 
@@ -1069,7 +1069,7 @@ async def ollama_gateway(path: str, request: Request):
         # pending nearest in time -- misattributing it to unrelated, often
         # allowed, local traffic.)
         req_info = {
-            "timestamp": time.time(), "service_name": "macbook-local",
+            "timestamp": time.time(), "service_name": settings.access_control.gateway_service,
             "endpoint": f"/{path}", "method": request.method,
             "client_ip": client_ip, "status_code": 403,
             "model": model, "error": "blocked: model not in remote_model_allowlist",
@@ -1087,7 +1087,7 @@ async def ollama_gateway(path: str, request: Request):
     switch_block = await _model_switch_block_info(model)
     if switch_block is not None:
         req_info = {
-            "timestamp": time.time(), "service_name": "macbook-local",
+            "timestamp": time.time(), "service_name": settings.access_control.gateway_service,
             "endpoint": f"/{path}", "method": request.method,
             "client_ip": client_ip, "status_code": 429,
             "model": model, "error": "blocked: model switch cooldown active",

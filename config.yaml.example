@@ -134,3 +134,6 @@ access_control:
   # retry with the right model instead of guessing. Off by default (false / 0).
   single_model_mode: false
   min_model_switch_interval_hours: 0
+
+  # ollama.services entry the gateway forwards to and logs blocked requests against.
+  gateway_service: "macbook-local"

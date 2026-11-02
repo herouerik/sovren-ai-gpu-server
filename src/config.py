@@ -198,6 +198,11 @@ class AccessControlConfig(BaseSettings):
     # no throttle at all.
     min_model_switch_interval_hours: float = 0
 
+    # Which ollama.services entry the gateway forwards to and attributes its
+    # blocked-request log rows to. The default is the macOS dev setup; on a
+    # multi-pool server it MUST be set, or the gateway falls back to port 11435.
+    gateway_service: str = "macbook-local"
+
     model_config = SettingsConfigDict(extra="allow")
 
 
